@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: wfm-optimizer
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: DB_URL
+        sync: false
+      - key: API_KEY
+        sync: false
