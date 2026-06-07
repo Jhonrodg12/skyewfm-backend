@@ -155,3 +155,25 @@ def dimension_roster(largo, AHT, SLA, ASA, OCC, UTL, ESP_MAX, LARGO, NDA_OBJ, PA
             "weekend_sin_cubrir": weekend_sin_cubrir,
             "total": int(largo["volumen"].sum())}
 
+
+
+# ===== Helpers para visualización de planeación (añadido Bloque 1) =====
+LIBRES_VIZ = {p: {p, (p + 1) % 7} for p in range(7)}
+
+def cubierto(S, turnos, dw, h):
+    cob = sum(v for k, v in S["xc"].items()
+              if dw not in LIBRES_VIZ[int(k.split("_")[1])] and h in turnos[int(k.split("_")[0])])
+    cob += sum(v for k, v in S["xe"].items()
+               if dw not in LIBRES_VIZ[5] and h in turnos[int(k)])
+    return cob
+
+def turnos_dict(S, largo):
+    """Reconstruye el dict de turnos {hora_inicio: set(horas_cubiertas)} desde S."""
+    turnos = {}
+    for k in S["xc"]:
+        t = int(k.split("_")[0])
+        turnos[t] = set((t + i) % 24 for i in range(largo))
+    for k in S["xe"]:
+        t = int(k)
+        turnos[t] = set((t + i) % 24 for i in range(largo))
+    return turnos

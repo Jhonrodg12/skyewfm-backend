@@ -81,6 +81,77 @@ def health():
     return {"status": "ok", "service": "WFM Optimizer API"}
 
 
+@app.post("/planeacion")
+async def planeacion(
+    x_api_key: str = Header(None),
+    mes: str = Form(...),
+    archivo: UploadFile = File(...),
+    aht: int = Form(420),
+    sla: float = Form(0.80),
+    asa: int = Form(20),
+    occ: float = Form(0.65),
+    utl: float = Form(0.88),
+    esp_max: int = Form(12),
+    largo: int = Form(9),
+    nda_obj: float = Form(0.96),
+    paciencia: int = Form(90),
+    estructura: str = Form("mixto"),
+    absentismo: float = Form(0.15),
+):
+    """Corre el optimizador y devuelve datos para graficar SIN escribir en la base."""
+    check_key(x_api_key)
+    file_bytes = await archivo.read()
+    largo_df = motor.largo_desde_historico(file_bytes, mes, "Nacional España", 4, 6, 0.0, mixto=False)
+    S = motor.dimension_roster(largo_df, aht, sla, asa, occ, utl, esp_max, largo,
+                               nda_obj, paciencia, estructura)
+    turnos = motor.turnos_dict(S, largo)
+
+    # Datos por día (0=Lun .. 6=Dom): requerido, programado, ocupación, NDA
+    NOM = ["Lunes", "Martes", "Miércoles", "Jueves", "Viernes", "Sábado", "Domingo"]
+    por_dia = []
+    for d in range(7):
+        req = [S["peak"][d][h] for h in range(24)]
+        cob = [motor.cubierto(S, turnos, d, h) for h in range(24)]
+        occv = [round(S["occ"][d][h] * 100, 1) for h in range(24)]
+        ndav = [round(S["nda"][d][h] * 100, 1) for h in range(24)]
+        por_dia.append({"dia": d, "nombre": NOM[d], "requerido": req,
+                        "programado": cob, "ocupacion": occv, "nda": ndav})
+
+    # Plan de turnos (tabla)
+    plan = []
+    for k in sorted(S["xe"], key=int):
+        t = int(k)
+        plan.append({"pais": "España", "inicio": f"{t:02d}:00",
+                     "fin": f"{(t+largo)%24:02d}:00", "cantidad": S["xe"][k],
+                     "libres": "Sáb, Dom"})
+    for k in sorted(S["xc"], key=lambda x: (int(x.split("_")[0]), int(x.split("_")[1]))):
+        t, p = map(int, k.split("_"))
+        o = sorted(motor.LIBRES_VIZ[p])
+        plan.append({"pais": "Colombia", "inicio": f"{t:02d}:00",
+                     "fin": f"{(t+largo)%24:02d}:00", "cantidad": S["xc"][k],
+                     "libres": f"{NOM[o[0]][:3]}, {NOM[o[1]][:3]}"})
+
+    import math as _m
+    presentes = S["te"] + S["tc"]
+    en_nomina = _m.ceil(presentes / (1 - absentismo)) if absentismo < 1 else presentes
+
+    return {
+        "ok": True,
+        "mes": mes,
+        "volumen_total": S["total"],
+        "estructura": estructura,
+        "plantilla": {
+            "espana_lv": S["te"],
+            "colombia_247": S["tc"],
+            "total_presentes": presentes,
+            "en_nomina": en_nomina,
+        },
+        "por_dia": por_dia,
+        "plan_turnos": plan,
+        "objetivos": {"occ": round(occ * 100, 1), "nda": round(nda_obj * 100, 1)},
+    }
+
+
 @app.post("/generar-roster")
 async def generar_roster(
     x_api_key: str = Header(None),
