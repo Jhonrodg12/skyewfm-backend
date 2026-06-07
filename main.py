@@ -560,38 +560,48 @@ async def generar_roster(
     n_asig = len(filas)
 
     # 5) Cargar asignaciones (limpiar mes antes, PERO conservando las bloqueadas)
-    #    Todo en UNA transacción: o se escribe completo, o no se toca nada (evita rosters a medias).
-    #    Usamos la lista 'filas' directamente (tipos nativos: None real e int real).
-    #    ON CONFLICT: si ya existe (agente_id, fecha), la actualiza SOLO si no está bloqueada.
+    #    INSERT MULTI-FILA con ON CONFLICT: mete muchas filas por sentencia (rápido),
+    #    y si una (agente_id, fecha) ya existe, la actualiza SOLO si no está bloqueada.
     #    Así nunca choca con la restricción única y respeta los turnos bloqueados por el WFM.
-    #    Cada operación tiene su PROPIO commit (engine.begin por lote), en vez de una
-    #    transacción gigante. Así el proceso libera la conexión periódicamente y puede
-    #    responder al health check de Render (evita el timeout que reiniciaba el servicio).
-    ins = text("""
-        INSERT INTO asignaciones (agente_id, fecha, campana_id, turno_id, hora_inicio, hora_fin, tipo, creado_por)
-        VALUES (:agente_id, :fecha, :campana_id, :turno_id, :hora_inicio, :hora_fin, :tipo, :creado_por)
-        ON CONFLICT (agente_id, fecha) DO UPDATE SET
-            campana_id = EXCLUDED.campana_id,
-            turno_id = EXCLUDED.turno_id,
-            hora_inicio = EXCLUDED.hora_inicio,
-            hora_fin = EXCLUDED.hora_fin,
-            tipo = EXCLUDED.tipo,
-            creado_por = EXCLUDED.creado_por
-        WHERE asignaciones.bloqueado IS NOT TRUE
-    """)
+    import time as _time
+    _marcas = {}
     try:
-        # DELETE de las no-bloqueadas en su propio commit
+        _t = _time.time()
+        # DELETE de las no-bloqueadas
         with engine.begin() as conn:
             conn.execute(text("DELETE FROM asignaciones WHERE campana_id=:c AND fecha>=:i AND fecha<=:f AND (bloqueado IS NULL OR bloqueado = false)"),
                          {"c": int(id_campana), "i": dias_mes[0].date(), "f": dias_mes[-1].date()})
-        # INSERT por lotes pequeños, cada lote con su propio commit
-        LOTE = 300
-        for k in range(0, len(filas), LOTE):
-            with engine.begin() as conn:
-                conn.execute(ins, filas[k:k+LOTE])
+        _marcas["borrar"] = round(_time.time() - _t, 1)
+
+        _t = _time.time()
+        cols = ["agente_id", "fecha", "campana_id", "turno_id", "hora_inicio", "hora_fin", "tipo", "creado_por"]
+        conflict = """
+            ON CONFLICT (agente_id, fecha) DO UPDATE SET
+                campana_id = EXCLUDED.campana_id,
+                turno_id = EXCLUDED.turno_id,
+                hora_inicio = EXCLUDED.hora_inicio,
+                hora_fin = EXCLUDED.hora_fin,
+                tipo = EXCLUDED.tipo,
+                creado_por = EXCLUDED.creado_por
+            WHERE asignaciones.bloqueado IS NOT TRUE
+        """
+        LOTE = 500
+        with engine.begin() as conn:
+            for k in range(0, len(filas), LOTE):
+                lote = filas[k:k+LOTE]
+                valores = []
+                params = {}
+                for j, f in enumerate(lote):
+                    valores.append(f"(:agente_id{j}, :fecha{j}, :campana_id{j}, :turno_id{j}, :hora_inicio{j}, :hora_fin{j}, :tipo{j}, :creado_por{j})")
+                    for col in cols:
+                        params[f"{col}{j}"] = f[col]
+                sql = "INSERT INTO asignaciones (" + ", ".join(cols) + ") VALUES " + ", ".join(valores) + conflict
+                conn.execute(text(sql), params)
+        _marcas["insertar"] = round(_time.time() - _t, 1)
     except Exception as e:
         ejemplo = filas[0] if filas else {}
         raise HTTPException(500, f"Error al escribir asignaciones: {type(e).__name__}: {str(e)[:300]} | ejemplo fila: {ejemplo}")
+    print(f"[generar-roster] tiempos escritura: {_marcas}", flush=True)
 
     # 6) Los breaks se generan en un endpoint aparte (/generar-breaks) para que esta
     #    respuesta sea rápida y no exceda el límite de tiempo de Cloudflare/Lovable.
