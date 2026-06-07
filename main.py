@@ -617,17 +617,25 @@ def generar_breaks(
     """Genera los breaks del mes a partir de las asignaciones ya creadas.
     Se llama DESPUÉS de /generar-roster para repartir el trabajo y no exceder el tiempo límite."""
     check_key(x_api_key)
+    import time as _time
+    _marcas = {}
+    _t0 = _time.time()
     engine = get_engine()
     id_campana = pd.read_sql(text("SELECT id FROM campanas WHERE nombre=:n"),
                              engine, params={"n": campana})["id"][0]
     dias_mes = pd.date_range(f"{mes}-01", pd.Timestamp(f"{mes}-01") + pd.offsets.MonthEnd(0))
+    _marcas["1_conexion_y_campana"] = round(_time.time() - _t0, 1)
 
+    _t = _time.time()
     asg = pd.read_sql(text("""
         SELECT a.id AS asignacion_id, a.hora_inicio, a.hora_fin, ag.pais
         FROM asignaciones a JOIN agentes ag ON ag.id=a.agente_id
         WHERE a.campana_id=:c AND a.tipo='trabajo' AND a.fecha BETWEEN :i AND :f
         ORDER BY a.fecha, a.hora_inicio, a.id
     """), engine, params={"c": int(id_campana), "i": dias_mes[0].date(), "f": dias_mes[-1].date()})
+    _marcas["2_leer_asignaciones"] = round(_time.time() - _t, 1)
+
+    _t = _time.time()
     filas_b = []; contador = defaultdict(int)
     for _, r in asg.iterrows():
         dur = dur_turno(r["hora_inicio"], r["hora_fin"]); idx = contador[r["hora_inicio"]]; contador[r["hora_inicio"]] += 1
@@ -635,25 +643,32 @@ def generar_breaks(
         for bhi, dm, tp in gen(r["hora_inicio"], round(dur), idx):
             filas_b.append({"asignacion_id": int(r["asignacion_id"]),
                             "hora_inicio": str(bhi), "duracion_min": int(dm), "tipo": str(tp)})
+    _marcas["3_calcular_breaks"] = round(_time.time() - _t, 1)
+
     ids = [int(x) for x in asg["asignacion_id"].tolist()]
     ins_b = text("""
         INSERT INTO breaks (asignacion_id, hora_inicio, duracion_min, tipo)
         VALUES (:asignacion_id, :hora_inicio, :duracion_min, :tipo)
     """)
     try:
-        # DELETE de los breaks viejos en lotes con commit propio (no una transacción gigante)
-        DEL = 500
-        for k in range(0, len(ids), DEL):
-            with engine.begin() as conn:
-                conn.execute(text("DELETE FROM breaks WHERE asignacion_id = ANY(:ids)"),
-                             {"ids": ids[k:k+DEL]})
-        # INSERT por lotes pequeños, cada lote con su propio commit
-        LOTE = 500
-        for k in range(0, len(filas_b), LOTE):
-            with engine.begin() as conn:
+        _t = _time.time()
+        # DELETE de los breaks viejos: un solo DELETE por todos los ids (con índice es rápido)
+        with engine.begin() as conn:
+            if ids:
+                conn.execute(text("DELETE FROM breaks WHERE asignacion_id = ANY(:ids)"), {"ids": ids})
+        _marcas["4_borrar_viejos"] = round(_time.time() - _t, 1)
+
+        _t = _time.time()
+        # INSERT en lotes grandes dentro de UNA sola conexión reutilizada
+        LOTE = 1000
+        with engine.begin() as conn:
+            for k in range(0, len(filas_b), LOTE):
                 conn.execute(ins_b, filas_b[k:k+LOTE])
+        _marcas["5_insertar_nuevos"] = round(_time.time() - _t, 1)
     except Exception as e:
         ejemplo = filas_b[0] if filas_b else {}
         raise HTTPException(500, f"Error al escribir breaks: {type(e).__name__}: {str(e)[:300]} | ejemplo: {ejemplo}")
 
-    return {"ok": True, "mes": mes, "breaks": len(filas_b)}
+    _marcas["TOTAL"] = round(_time.time() - _t0, 1)
+    print(f"[generar-breaks] tiempos: {_marcas}", flush=True)
+    return {"ok": True, "mes": mes, "breaks": len(filas_b), "tiempos_seg": _marcas}
