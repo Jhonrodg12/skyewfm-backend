@@ -81,6 +81,59 @@ def health():
     return {"status": "ok", "service": "WFM Optimizer API"}
 
 
+@app.get("/capacidad-anual")
+def capacidad_anual(
+    x_api_key: str = Header(None),
+    anio: int = 2026,
+    scope: str = "Nacional España",
+    K: int = 4,
+    aht: int = 420, sla: float = 0.80, asa: int = 20, occ: float = 0.65,
+    utl: float = 0.88, esp_max: int = 12, largo: int = 9,
+    nda_obj: float = 0.96, paciencia: int = 90,
+    estructura: str = "mixto", absentismo: float = 0.15,
+    plantilla_actual: int = 129,
+):
+    """Dimensiona los 12 meses del año: agentes necesarios por mes."""
+    check_key(x_api_key)
+    import math as _m
+    engine = get_engine()
+    file_bytes = _historico_a_csv_bytes(engine)
+    # fechas con datos reales (para marcar estado)
+    dch = pd.read_sql(text("SELECT DISTINCT fecha FROM historico_llamadas"), engine)
+    dias_datos = set(pd.to_datetime(dch["fecha"]).dt.normalize())
+
+    MESES = ["Ene","Feb","Mar","Abr","May","Jun","Jul","Ago","Sep","Oct","Nov","Dic"]
+    filas = []
+    for mth in range(1, 13):
+        mes_str = f"{anio}-{mth:02d}"
+        ini = pd.Timestamp(anio, mth, 1); dm = pd.date_range(ini, ini + pd.offsets.MonthEnd(0))
+        nr = sum(1 for t in dm if t in dias_datos)
+        estado = "Real" if nr >= len(dm) else ("En curso" if nr > 0 else "Proyectado")
+        try:
+            largo_df = motor.largo_desde_historico(file_bytes, mes_str, scope, K, 6, 0.0, mixto=False)
+            Sx = motor.dimension_roster(largo_df, aht, sla, asa, occ, utl, esp_max, largo,
+                                        nda_obj, paciencia, estructura)
+            presentes = Sx["te"] + Sx["tc"]
+            nomina = _m.ceil(presentes / (1 - absentismo)) if absentismo < 1 else presentes
+            filas.append({"mes": MESES[mth-1], "estado": estado, "volumen": Sx["total"],
+                          "espana": Sx["te"], "colombia": Sx["tc"], "presentes": presentes,
+                          "en_nomina": nomina})
+        except Exception:
+            filas.append({"mes": MESES[mth-1], "estado": estado, "volumen": 0,
+                          "espana": 0, "colombia": 0, "presentes": 0, "en_nomina": 0})
+
+    validos = [f for f in filas if f["en_nomina"] > 0]
+    pico = max(validos, key=lambda f: f["en_nomina"]) if validos else None
+    prom = round(sum(f["en_nomina"] for f in validos) / len(validos)) if validos else 0
+    return {
+        "ok": True, "anio": anio,
+        "tabla": filas,
+        "mes_pico": {"mes": pico["mes"], "en_nomina": pico["en_nomina"]} if pico else None,
+        "promedio_nomina": prom,
+        "plantilla_actual": plantilla_actual,
+    }
+
+
 @app.get("/proyeccion-anual")
 def proyeccion_anual(
     x_api_key: str = Header(None),
