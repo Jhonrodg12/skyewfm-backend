@@ -586,7 +586,35 @@ async def generar_roster(
         ejemplo = filas[0] if filas else {}
         raise HTTPException(500, f"Error al escribir asignaciones: {type(e).__name__}: {str(e)[:300]} | ejemplo fila: {ejemplo}")
 
-    # 6) Generar y cargar breaks
+    # 6) Los breaks se generan en un endpoint aparte (/generar-breaks) para que esta
+    #    respuesta sea rápida y no exceda el límite de tiempo de Cloudflare/Lovable.
+
+    return {
+        "ok": True,
+        "mes": mes,
+        "volumen_total": S["total"],
+        "asignaciones": n_asig,
+        "breaks": "pendiente",
+        "nota": "Asignaciones generadas. Los breaks se generan en el paso siguiente.",
+        "colombia": res_col,
+        "espana": res_esp,
+    }
+
+
+@app.post("/generar-breaks")
+def generar_breaks(
+    x_api_key: str = Header(None),
+    mes: str = Form(...),
+    campana: str = Form("Endesa"),
+):
+    """Genera los breaks del mes a partir de las asignaciones ya creadas.
+    Se llama DESPUÉS de /generar-roster para repartir el trabajo y no exceder el tiempo límite."""
+    check_key(x_api_key)
+    engine = get_engine()
+    id_campana = pd.read_sql(text("SELECT id FROM campanas WHERE nombre=:n"),
+                             engine, params={"n": campana})["id"][0]
+    dias_mes = pd.date_range(f"{mes}-01", pd.Timestamp(f"{mes}-01") + pd.offsets.MonthEnd(0))
+
     asg = pd.read_sql(text("""
         SELECT a.id AS asignacion_id, a.hora_inicio, a.hora_fin, ag.pais
         FROM asignaciones a JOIN agentes ag ON ag.id=a.agente_id
@@ -604,8 +632,7 @@ async def generar_roster(
     try:
         with engine.begin() as conn:
             if ids:
-                conn.execute(text("DELETE FROM breaks WHERE asignacion_id = ANY(:ids)"),
-                             {"ids": ids})
+                conn.execute(text("DELETE FROM breaks WHERE asignacion_id = ANY(:ids)"), {"ids": ids})
             if filas_b:
                 ins_b = text("""
                     INSERT INTO breaks (asignacion_id, hora_inicio, duracion_min, tipo)
@@ -617,12 +644,4 @@ async def generar_roster(
         ejemplo = filas_b[0] if filas_b else {}
         raise HTTPException(500, f"Error al escribir breaks: {type(e).__name__}: {str(e)[:300]} | ejemplo: {ejemplo}")
 
-    return {
-        "ok": True,
-        "mes": mes,
-        "volumen_total": S["total"],
-        "asignaciones": n_asig,
-        "breaks": len(filas_b),
-        "colombia": res_col,
-        "espana": res_esp,
-    }
+    return {"ok": True, "mes": mes, "breaks": len(filas_b)}
