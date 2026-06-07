@@ -81,11 +81,85 @@ def health():
     return {"status": "ok", "service": "WFM Optimizer API"}
 
 
+@app.post("/historico/actualizar")
+async def historico_actualizar(
+    x_api_key: str = Header(None),
+    archivo: UploadFile = File(...),
+):
+    """
+    Sube un CSV y lo fusiona con el histórico acumulado (upsert):
+    - Filas con fecha+hora+cola ya existentes: se SOBRESCRIBEN.
+    - Filas nuevas: se AGREGAN.
+    Columnas esperadas: fecha, hora, cola, entrantes, atendidas, abandonadas.
+    """
+    check_key(x_api_key)
+    engine = get_engine()
+    file_bytes = await archivo.read()
+    df = pd.read_csv(io.BytesIO(file_bytes))
+    df.columns = [c.strip().lower() for c in df.columns]
+    req = {"fecha", "hora", "cola", "entrantes", "atendidas", "abandonadas"}
+    falta = req - set(df.columns)
+    if falta:
+        raise HTTPException(400, f"Faltan columnas en el CSV: {falta}")
+    df = df[list(req)].copy()
+    df["fecha"] = pd.to_datetime(df["fecha"]).dt.date
+    for c in ["hora", "entrantes", "atendidas", "abandonadas"]:
+        df[c] = df[c].astype(int)
+
+    filas_csv = len(df)
+    # upsert por lotes usando ON CONFLICT
+    insertadas = 0
+    with engine.begin() as conn:
+        for _, r in df.iterrows():
+            conn.execute(text("""
+                INSERT INTO historico_llamadas (fecha, hora, cola, entrantes, atendidas, abandonadas, actualizado_en)
+                VALUES (:f, :h, :c, :e, :a, :ab, now())
+                ON CONFLICT (fecha, hora, cola)
+                DO UPDATE SET entrantes=EXCLUDED.entrantes, atendidas=EXCLUDED.atendidas,
+                              abandonadas=EXCLUDED.abandonadas, actualizado_en=now()
+            """), {"f": r["fecha"], "h": int(r["hora"]), "c": str(r["cola"]),
+                   "e": int(r["entrantes"]), "a": int(r["atendidas"]), "ab": int(r["abandonadas"])})
+            insertadas += 1
+
+    # rango del histórico tras la actualización
+    rango = pd.read_sql(text("SELECT MIN(fecha) AS desde, MAX(fecha) AS hasta, COUNT(*) AS filas FROM historico_llamadas"), engine)
+    return {
+        "ok": True,
+        "filas_csv": filas_csv,
+        "filas_procesadas": insertadas,
+        "historico_desde": str(rango["desde"][0]),
+        "historico_hasta": str(rango["hasta"][0]),
+        "total_filas_historico": int(rango["filas"][0]),
+    }
+
+
+@app.get("/historico/estado")
+def historico_estado(x_api_key: str = Header(None)):
+    """Devuelve hasta qué fecha hay histórico cargado."""
+    check_key(x_api_key)
+    engine = get_engine()
+    rango = pd.read_sql(text("SELECT MIN(fecha) AS desde, MAX(fecha) AS hasta, COUNT(*) AS filas FROM historico_llamadas"), engine)
+    if rango["filas"][0] == 0:
+        return {"ok": True, "vacio": True}
+    return {
+        "ok": True, "vacio": False,
+        "historico_desde": str(rango["desde"][0]),
+        "historico_hasta": str(rango["hasta"][0]),
+        "total_filas": int(rango["filas"][0]),
+    }
+
+
+def _historico_a_csv_bytes(engine):
+    """Lee todo el histórico de la base y lo devuelve como CSV en bytes (para el optimizador)."""
+    df = pd.read_sql(text("SELECT fecha, hora, cola, entrantes, atendidas, abandonadas FROM historico_llamadas ORDER BY fecha, hora"), engine)
+    return df.to_csv(index=False).encode()
+
+
 @app.post("/planeacion")
 async def planeacion(
     x_api_key: str = Header(None),
     mes: str = Form(...),
-    archivo: UploadFile = File(...),
+    archivo: UploadFile = File(None),
     aht: int = Form(420),
     sla: float = Form(0.80),
     asa: int = Form(20),
@@ -100,7 +174,10 @@ async def planeacion(
 ):
     """Corre el optimizador y devuelve datos para graficar SIN escribir en la base."""
     check_key(x_api_key)
-    file_bytes = await archivo.read()
+    if archivo is not None:
+        file_bytes = await archivo.read()
+    else:
+        file_bytes = _historico_a_csv_bytes(get_engine())
     largo_df = motor.largo_desde_historico(file_bytes, mes, "Nacional España", 4, 6, 0.0, mixto=False)
     S = motor.dimension_roster(largo_df, aht, sla, asa, occ, utl, esp_max, largo,
                                nda_obj, paciencia, estructura)
@@ -157,7 +234,7 @@ async def generar_roster(
     x_api_key: str = Header(None),
     mes: str = Form(...),                 # "2026-07"
     campana: str = Form("Endesa"),
-    archivo: UploadFile = File(...),      # historico.csv
+    archivo: UploadFile = File(None),     # historico.csv (opcional: si no, usa histórico de base)
     aht: int = Form(420),
     sla: float = Form(0.80),
     asa: int = Form(20),
@@ -172,8 +249,11 @@ async def generar_roster(
     check_key(x_api_key)
     engine = get_engine()
 
-    # 1) Leer histórico y correr optimizador
-    file_bytes = await archivo.read()
+    # 1) Leer histórico (del CSV subido o del histórico acumulado en la base) y correr optimizador
+    if archivo is not None:
+        file_bytes = await archivo.read()
+    else:
+        file_bytes = _historico_a_csv_bytes(engine)
     largo_df = motor.largo_desde_historico(file_bytes, mes, "Nacional España", 4, 6, 0.0, mixto=False)
     S = motor.dimension_roster(largo_df, aht, sla, asa, occ, utl, esp_max, largo,
                                nda_obj, paciencia, estructura)
