@@ -592,17 +592,21 @@ async def generar_roster(
             filas_b.append({"asignacion_id": int(r["asignacion_id"]),
                             "hora_inicio": str(bhi), "duracion_min": int(dm), "tipo": str(tp)})
     ids = [int(x) for x in asg["asignacion_id"].tolist()]
-    with engine.begin() as conn:
-        if ids:
-            conn.execute(text("DELETE FROM breaks WHERE asignacion_id = ANY(:ids)"),
-                         {"ids": ids})
-        if filas_b:
-            ins_b = text("""
-                INSERT INTO breaks (asignacion_id, hora_inicio, duracion_min, tipo)
-                VALUES (:asignacion_id, :hora_inicio, :duracion_min, :tipo)
-            """)
-            for k in range(0, len(filas_b), 1000):
-                conn.execute(ins_b, filas_b[k:k+1000])
+    try:
+        with engine.begin() as conn:
+            if ids:
+                conn.execute(text("DELETE FROM breaks WHERE asignacion_id = ANY(:ids)"),
+                             {"ids": ids})
+            if filas_b:
+                ins_b = text("""
+                    INSERT INTO breaks (asignacion_id, hora_inicio, duracion_min, tipo)
+                    VALUES (:asignacion_id, :hora_inicio, :duracion_min, :tipo)
+                """)
+                for k in range(0, len(filas_b), 1000):
+                    conn.execute(ins_b, filas_b[k:k+1000])
+    except Exception as e:
+        ejemplo = filas_b[0] if filas_b else {}
+        raise HTTPException(500, f"Error al escribir breaks: {type(e).__name__}: {str(e)[:300]} | ejemplo: {ejemplo}")
 
     return {
         "ok": True,
