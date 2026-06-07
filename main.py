@@ -561,16 +561,21 @@ async def generar_roster(
 
     # 5) Cargar asignaciones (limpiar mes antes, PERO conservando las bloqueadas)
     #    Todo en UNA transacción: o se escribe completo, o no se toca nada (evita rosters a medias).
-    #    Usamos la lista 'filas' directamente (tipos nativos: None real e int real),
-    #    NO un DataFrame, que convertiría turno_id a float con NaN y Postgres lo rechaza.
-    with engine.begin() as conn:
-        conn.execute(text("DELETE FROM asignaciones WHERE campana_id=:c AND fecha>=:i AND fecha<=:f AND (bloqueado IS NULL OR bloqueado = false)"),
-                     {"c": int(id_campana), "i": dias_mes[0].date(), "f": dias_mes[-1].date()})
-        if filas:
-            conn.execute(text("""
+    #    Usamos la lista 'filas' directamente (tipos nativos: None real e int real).
+    #    Insertamos por LOTES de 500 para no exceder el límite de parámetros del driver.
+    try:
+        with engine.begin() as conn:
+            conn.execute(text("DELETE FROM asignaciones WHERE campana_id=:c AND fecha>=:i AND fecha<=:f AND (bloqueado IS NULL OR bloqueado = false)"),
+                         {"c": int(id_campana), "i": dias_mes[0].date(), "f": dias_mes[-1].date()})
+            ins = text("""
                 INSERT INTO asignaciones (agente_id, fecha, campana_id, turno_id, hora_inicio, hora_fin, tipo, creado_por)
                 VALUES (:agente_id, :fecha, :campana_id, :turno_id, :hora_inicio, :hora_fin, :tipo, :creado_por)
-            """), filas)
+            """)
+            for k in range(0, len(filas), 500):
+                conn.execute(ins, filas[k:k+500])
+    except Exception as e:
+        ejemplo = filas[0] if filas else {}
+        raise HTTPException(500, f"Error al escribir asignaciones: {type(e).__name__}: {str(e)[:300]} | ejemplo fila: {ejemplo}")
 
     # 6) Generar y cargar breaks
     asg = pd.read_sql(text("""
@@ -592,10 +597,12 @@ async def generar_roster(
             conn.execute(text("DELETE FROM breaks WHERE asignacion_id = ANY(:ids)"),
                          {"ids": ids})
         if filas_b:
-            conn.execute(text("""
+            ins_b = text("""
                 INSERT INTO breaks (asignacion_id, hora_inicio, duracion_min, tipo)
                 VALUES (:asignacion_id, :hora_inicio, :duracion_min, :tipo)
-            """), filas_b)
+            """)
+            for k in range(0, len(filas_b), 500):
+                conn.execute(ins_b, filas_b[k:k+500])
 
     return {
         "ok": True,
