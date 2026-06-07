@@ -81,6 +81,90 @@ def health():
     return {"status": "ok", "service": "WFM Optimizer API"}
 
 
+@app.get("/dashboard-historico")
+def dashboard_historico(
+    x_api_key: str = Header(None),
+    anio: int = None,
+    mes: int = None,
+    semana: int = None,
+    colas: str = None,   # colas separadas por coma; vacío = todas
+    dows: str = None,    # días de semana 0-6 separados por coma; vacío = todos
+):
+    """Devuelve datos agregados del histórico para el dashboard, según filtros."""
+    check_key(x_api_key)
+    engine = get_engine()
+    df = pd.read_sql(text("SELECT fecha, hora, cola, entrantes, atendidas, abandonadas FROM historico_llamadas"), engine)
+    if df.empty:
+        return {"ok": True, "vacio": True}
+    df["fecha"] = pd.to_datetime(df["fecha"])
+    df["anio"] = df["fecha"].dt.year
+    df["mes"] = df["fecha"].dt.month
+    df["semana"] = df["fecha"].dt.isocalendar().week.astype(int)
+    df["dow"] = df["fecha"].dt.dayofweek
+
+    if anio:
+        df = df[df["anio"] == anio]
+    if mes:
+        df = df[df["mes"] == mes]
+    if semana:
+        df = df[df["semana"] == semana]
+    if colas:
+        lista = [c.strip() for c in colas.split(",") if c.strip()]
+        if lista:
+            df = df[df["cola"].isin(lista)]
+    if dows:
+        lista_d = [int(x) for x in dows.split(",") if x.strip().isdigit()]
+        if lista_d:
+            df = df[df["dow"].isin(lista_d)]
+
+    if df.empty:
+        return {"ok": True, "vacio": False, "sin_datos_filtro": True}
+
+    ent = int(df["entrantes"].sum()); at = int(df["atendidas"].sum()); ab = int(df["abandonadas"].sum())
+
+    # Por cola
+    by = df.groupby("cola")[["entrantes", "atendidas", "abandonadas"]].sum().reset_index()
+    by["pat"] = (by["atendidas"] / by["entrantes"].replace(0, pd.NA) * 100).round(1)
+    by = by.sort_values("entrantes", ascending=False)
+    por_cola = by.to_dict("records")
+
+    # % atención en el tiempo (por fecha)
+    serie = df.groupby(df["fecha"].dt.strftime("%Y-%m-%d"))[["entrantes", "atendidas"]].sum()
+    serie["pat"] = (serie["atendidas"] / serie["entrantes"].replace(0, pd.NA) * 100).round(1)
+    en_tiempo = [{"fecha": idx, "pat": (None if pd.isna(row["pat"]) else float(row["pat"]))}
+                 for idx, row in serie.iterrows()]
+
+    # Por franja horaria
+    fr = df.groupby("hora")[["entrantes", "atendidas", "abandonadas"]].sum()
+    fr["pat"] = (fr["atendidas"] / fr["entrantes"].replace(0, pd.NA) * 100).round(1)
+    por_hora = [{"hora": int(h), "entrantes": int(row["entrantes"]),
+                 "pat": (None if pd.isna(row["pat"]) else float(row["pat"]))}
+                for h, row in fr.iterrows()]
+
+    return {
+        "ok": True, "vacio": False,
+        "metricas": {"entrantes": ent, "atendidas": at, "abandonadas": ab,
+                     "pct_atencion": round(at / ent * 100, 1) if ent else None},
+        "por_cola": por_cola,
+        "en_tiempo": en_tiempo,
+        "por_hora": por_hora,
+    }
+
+
+@app.get("/dashboard-opciones")
+def dashboard_opciones(x_api_key: str = Header(None)):
+    """Devuelve los valores disponibles para los filtros (años, colas)."""
+    check_key(x_api_key)
+    engine = get_engine()
+    df = pd.read_sql(text("SELECT DISTINCT fecha, cola FROM historico_llamadas"), engine)
+    if df.empty:
+        return {"ok": True, "anios": [], "colas": []}
+    df["fecha"] = pd.to_datetime(df["fecha"])
+    anios = sorted(df["fecha"].dt.year.unique().tolist())
+    colas = sorted(df["cola"].unique().tolist())
+    return {"ok": True, "anios": anios, "colas": colas}
+
+
 @app.post("/historico/actualizar")
 async def historico_actualizar(
     x_api_key: str = Header(None),
