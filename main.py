@@ -584,25 +584,25 @@ async def generar_roster(
         dur = dur_turno(r["hora_inicio"], r["hora_fin"]); idx = contador[r["hora_inicio"]]; contador[r["hora_inicio"]] += 1
         gen = breaks_colombia if r["pais"] == "Colombia" else breaks_espana
         for bhi, dm, tp in gen(r["hora_inicio"], round(dur), idx):
-            filas_b.append({"asignacion_id": int(r["asignacion_id"]), "hora_inicio": bhi, "duracion_min": dm, "tipo": tp})
-    df_b = pd.DataFrame(filas_b)
+            filas_b.append({"asignacion_id": int(r["asignacion_id"]),
+                            "hora_inicio": str(bhi), "duracion_min": int(dm), "tipo": str(tp)})
     ids = [int(x) for x in asg["asignacion_id"].tolist()]
-    registros_b = df_b.to_dict("records") if not df_b.empty else []
     with engine.begin() as conn:
         if ids:
-            conn.execute(text("DELETE FROM breaks WHERE asignacion_id = ANY(:ids)"), {"ids": ids})
-        if registros_b:
+            conn.execute(text("DELETE FROM breaks WHERE asignacion_id = ANY(:ids)"),
+                         {"ids": ids})
+        if filas_b:
             conn.execute(text("""
                 INSERT INTO breaks (asignacion_id, hora_inicio, duracion_min, tipo)
                 VALUES (:asignacion_id, :hora_inicio, :duracion_min, :tipo)
-            """), registros_b)
+            """), filas_b)
 
     return {
         "ok": True,
         "mes": mes,
         "volumen_total": S["total"],
         "asignaciones": len(df_asig),
-        "breaks": len(df_b),
+        "breaks": len(filas_b),
         "colombia": res_col,
         "espana": res_esp,
     }
