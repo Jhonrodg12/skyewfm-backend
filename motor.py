@@ -144,7 +144,12 @@ def dimension_roster(largo, AHT, SLA, ASA, OCC, UTL, ESP_MAX, LARGO, NDA_OBJ, PA
     if tiene_fijo:
         objetivo = objetivo + (-sum(xe.values()) if estructura == "mixto" else sum(xe.values()))
     m.Minimize(objetivo)
-    sv = cp_model.CpSolver(); sv.Solve(m)
+    sv = cp_model.CpSolver()
+    # Límite de tiempo: si no encuentra el óptimo en 15s, usa la mejor solución hallada.
+    # Sin esto, OR-Tools puede buscar el óptimo durante mucho tiempo y agotar el límite de Render.
+    sv.parameters.max_time_in_seconds = 15.0
+    sv.parameters.num_search_workers = 4
+    sv.Solve(m)
 
     xe_s = {str(t): sv.Value(xe[t]) for t in xe if sv.Value(xe[t]) > 0}
     xc_s = {f"{t}_{p}": sv.Value(xc[(t, p)]) for (t, p) in xc if sv.Value(xc[(t, p)]) > 0}

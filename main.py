@@ -564,24 +564,31 @@ async def generar_roster(
     #    Usamos la lista 'filas' directamente (tipos nativos: None real e int real).
     #    ON CONFLICT: si ya existe (agente_id, fecha), la actualiza SOLO si no está bloqueada.
     #    Así nunca choca con la restricción única y respeta los turnos bloqueados por el WFM.
+    #    Cada operación tiene su PROPIO commit (engine.begin por lote), en vez de una
+    #    transacción gigante. Así el proceso libera la conexión periódicamente y puede
+    #    responder al health check de Render (evita el timeout que reiniciaba el servicio).
+    ins = text("""
+        INSERT INTO asignaciones (agente_id, fecha, campana_id, turno_id, hora_inicio, hora_fin, tipo, creado_por)
+        VALUES (:agente_id, :fecha, :campana_id, :turno_id, :hora_inicio, :hora_fin, :tipo, :creado_por)
+        ON CONFLICT (agente_id, fecha) DO UPDATE SET
+            campana_id = EXCLUDED.campana_id,
+            turno_id = EXCLUDED.turno_id,
+            hora_inicio = EXCLUDED.hora_inicio,
+            hora_fin = EXCLUDED.hora_fin,
+            tipo = EXCLUDED.tipo,
+            creado_por = EXCLUDED.creado_por
+        WHERE asignaciones.bloqueado IS NOT TRUE
+    """)
     try:
+        # DELETE de las no-bloqueadas en su propio commit
         with engine.begin() as conn:
             conn.execute(text("DELETE FROM asignaciones WHERE campana_id=:c AND fecha>=:i AND fecha<=:f AND (bloqueado IS NULL OR bloqueado = false)"),
                          {"c": int(id_campana), "i": dias_mes[0].date(), "f": dias_mes[-1].date()})
-            ins = text("""
-                INSERT INTO asignaciones (agente_id, fecha, campana_id, turno_id, hora_inicio, hora_fin, tipo, creado_por)
-                VALUES (:agente_id, :fecha, :campana_id, :turno_id, :hora_inicio, :hora_fin, :tipo, :creado_por)
-                ON CONFLICT (agente_id, fecha) DO UPDATE SET
-                    campana_id = EXCLUDED.campana_id,
-                    turno_id = EXCLUDED.turno_id,
-                    hora_inicio = EXCLUDED.hora_inicio,
-                    hora_fin = EXCLUDED.hora_fin,
-                    tipo = EXCLUDED.tipo,
-                    creado_por = EXCLUDED.creado_por
-                WHERE asignaciones.bloqueado IS NOT TRUE
-            """)
-            for k in range(0, len(filas), 1000):
-                conn.execute(ins, filas[k:k+1000])
+        # INSERT por lotes pequeños, cada lote con su propio commit
+        LOTE = 300
+        for k in range(0, len(filas), LOTE):
+            with engine.begin() as conn:
+                conn.execute(ins, filas[k:k+LOTE])
     except Exception as e:
         ejemplo = filas[0] if filas else {}
         raise HTTPException(500, f"Error al escribir asignaciones: {type(e).__name__}: {str(e)[:300]} | ejemplo fila: {ejemplo}")
