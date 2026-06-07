@@ -636,17 +636,22 @@ def generar_breaks(
             filas_b.append({"asignacion_id": int(r["asignacion_id"]),
                             "hora_inicio": str(bhi), "duracion_min": int(dm), "tipo": str(tp)})
     ids = [int(x) for x in asg["asignacion_id"].tolist()]
+    ins_b = text("""
+        INSERT INTO breaks (asignacion_id, hora_inicio, duracion_min, tipo)
+        VALUES (:asignacion_id, :hora_inicio, :duracion_min, :tipo)
+    """)
     try:
-        with engine.begin() as conn:
-            if ids:
-                conn.execute(text("DELETE FROM breaks WHERE asignacion_id = ANY(:ids)"), {"ids": ids})
-            if filas_b:
-                ins_b = text("""
-                    INSERT INTO breaks (asignacion_id, hora_inicio, duracion_min, tipo)
-                    VALUES (:asignacion_id, :hora_inicio, :duracion_min, :tipo)
-                """)
-                for k in range(0, len(filas_b), 1000):
-                    conn.execute(ins_b, filas_b[k:k+1000])
+        # DELETE de los breaks viejos en lotes con commit propio (no una transacción gigante)
+        DEL = 500
+        for k in range(0, len(ids), DEL):
+            with engine.begin() as conn:
+                conn.execute(text("DELETE FROM breaks WHERE asignacion_id = ANY(:ids)"),
+                             {"ids": ids[k:k+DEL]})
+        # INSERT por lotes pequeños, cada lote con su propio commit
+        LOTE = 500
+        for k in range(0, len(filas_b), LOTE):
+            with engine.begin() as conn:
+                conn.execute(ins_b, filas_b[k:k+LOTE])
     except Exception as e:
         ejemplo = filas_b[0] if filas_b else {}
         raise HTTPException(500, f"Error al escribir breaks: {type(e).__name__}: {str(e)[:300]} | ejemplo: {ejemplo}")
