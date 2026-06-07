@@ -562,7 +562,8 @@ async def generar_roster(
     # 5) Cargar asignaciones (limpiar mes antes, PERO conservando las bloqueadas)
     #    Todo en UNA transacción: o se escribe completo, o no se toca nada (evita rosters a medias).
     #    Usamos la lista 'filas' directamente (tipos nativos: None real e int real).
-    #    Insertamos por LOTES de 500 para no exceder el límite de parámetros del driver.
+    #    ON CONFLICT: si ya existe (agente_id, fecha), la actualiza SOLO si no está bloqueada.
+    #    Así nunca choca con la restricción única y respeta los turnos bloqueados por el WFM.
     try:
         with engine.begin() as conn:
             conn.execute(text("DELETE FROM asignaciones WHERE campana_id=:c AND fecha>=:i AND fecha<=:f AND (bloqueado IS NULL OR bloqueado = false)"),
@@ -570,6 +571,14 @@ async def generar_roster(
             ins = text("""
                 INSERT INTO asignaciones (agente_id, fecha, campana_id, turno_id, hora_inicio, hora_fin, tipo, creado_por)
                 VALUES (:agente_id, :fecha, :campana_id, :turno_id, :hora_inicio, :hora_fin, :tipo, :creado_por)
+                ON CONFLICT (agente_id, fecha) DO UPDATE SET
+                    campana_id = EXCLUDED.campana_id,
+                    turno_id = EXCLUDED.turno_id,
+                    hora_inicio = EXCLUDED.hora_inicio,
+                    hora_fin = EXCLUDED.hora_fin,
+                    tipo = EXCLUDED.tipo,
+                    creado_por = EXCLUDED.creado_por
+                WHERE asignaciones.bloqueado IS NOT TRUE
             """)
             for k in range(0, len(filas), 1000):
                 conn.execute(ins, filas[k:k+1000])
