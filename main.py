@@ -557,20 +557,20 @@ async def generar_roster(
             else:
                 filas.append({"agente_id": int(a["id"]), "fecha": d.date(), "campana_id": int(id_campana),
                               "turno_id": int(tid), "hora_inicio": f"{hi:02d}:00", "hora_fin": f"{hora_fin:02d}:00", "tipo": "trabajo", "creado_por": "optimizador-web"})
-    df_asig = pd.DataFrame(filas)
+    n_asig = len(filas)
 
     # 5) Cargar asignaciones (limpiar mes antes, PERO conservando las bloqueadas)
-    # 5) Cargar asignaciones (limpiar mes antes, PERO conservando las bloqueadas)
     #    Todo en UNA transacción: o se escribe completo, o no se toca nada (evita rosters a medias).
-    registros = df_asig.to_dict("records")
+    #    Usamos la lista 'filas' directamente (tipos nativos: None real e int real),
+    #    NO un DataFrame, que convertiría turno_id a float con NaN y Postgres lo rechaza.
     with engine.begin() as conn:
         conn.execute(text("DELETE FROM asignaciones WHERE campana_id=:c AND fecha>=:i AND fecha<=:f AND (bloqueado IS NULL OR bloqueado = false)"),
                      {"c": int(id_campana), "i": dias_mes[0].date(), "f": dias_mes[-1].date()})
-        if registros:
+        if filas:
             conn.execute(text("""
                 INSERT INTO asignaciones (agente_id, fecha, campana_id, turno_id, hora_inicio, hora_fin, tipo, creado_por)
                 VALUES (:agente_id, :fecha, :campana_id, :turno_id, :hora_inicio, :hora_fin, :tipo, :creado_por)
-            """), registros)
+            """), filas)
 
     # 6) Generar y cargar breaks
     asg = pd.read_sql(text("""
@@ -601,7 +601,7 @@ async def generar_roster(
         "ok": True,
         "mes": mes,
         "volumen_total": S["total"],
-        "asignaciones": len(df_asig),
+        "asignaciones": n_asig,
         "breaks": len(filas_b),
         "colombia": res_col,
         "espana": res_esp,
