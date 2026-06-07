@@ -81,6 +81,109 @@ def health():
     return {"status": "ok", "service": "WFM Optimizer API"}
 
 
+@app.get("/proyeccion-anual")
+def proyeccion_anual(
+    x_api_key: str = Header(None),
+    anio: int = None,
+    K: int = 4,
+    recencia: float = 0.0,
+    scope: str = "Nacional España",
+    colas: str = None,
+    ajuste_meses: str = None,   # 12 valores % separados por coma, ej "0,0,10,0,..."
+):
+    """Proyección anual de volumen: Base (sin ajustes) vs Escenario (con ajustes)."""
+    check_key(x_api_key)
+    import holidays as _hol
+    engine = get_engine()
+    d = pd.read_sql(text("SELECT fecha, cola, entrantes FROM historico_llamadas"), engine)
+    if d.empty:
+        return {"ok": True, "vacio": True}
+    d["fecha"] = pd.to_datetime(d["fecha"]).dt.normalize()
+    d["entrantes"] = pd.to_numeric(d["entrantes"], errors="coerce").fillna(0)
+
+    share = d.groupby("cola")["entrantes"].sum().sort_values(ascending=False)
+    share_pct = (share / share.sum() * 100).round(1)
+
+    colas_sel = [c.strip() for c in colas.split(",")] if colas else list(share.index)
+    colas_sel = [c for c in colas_sel if c in share.index] or list(share.index)
+    d = d[d["cola"].isin(colas_sel)]
+
+    dia = d.groupby("fecha")["entrantes"].sum()
+    if dia.empty:
+        return {"ok": True, "vacio": False, "sin_datos": True}
+    anios_disp = sorted({t.year for t in dia.index})
+    if anio is None:
+        anio = anios_disp[-1]
+
+    adj_mes = [0.0] * 12
+    if ajuste_meses:
+        parts = [p.strip() for p in ajuste_meses.split(",")]
+        for i, p in enumerate(parts[:12]):
+            try: adj_mes[i] = float(p) / 100.0
+            except: adj_mes[i] = 0.0
+
+    # peso por cola (sin ajuste de cola individual por ahora; el ajuste va por mes)
+    cola_factor = 1.0
+
+    if "Catal" in scope:
+        ES = _hol.Spain(years=range(min(anios_disp) - 1, max(anios_disp) + 2), subdiv="CT")
+    else:
+        ES = _hol.Spain(years=range(min(anios_disp) - 1, max(anios_disp) + 2))
+
+    def fest(t): return t.date() in ES
+
+    idx_dow = dia.index.dayofweek
+    def proj_dia(t):
+        wd = 6 if fest(t) else t.dayofweek
+        s = dia[(dia.index < t) & (idx_dow == wd)]
+        if wd != 6:
+            s = s[[not fest(x) for x in s.index]]
+        s = s.tail(K)
+        if len(s) == 0: return 0.0
+        v = s.values[::-1]
+        import numpy as _np
+        w = _np.array([(1 - recencia) ** j for j in range(len(v))])
+        return float((v * w).sum() / w.sum())
+
+    MESES = ["Ene","Feb","Mar","Abr","May","Jun","Jul","Ago","Sep","Oct","Nov","Dic"]
+    filas = []
+    for mth in range(1, 13):
+        ini = pd.Timestamp(year=anio, month=mth, day=1); fin = ini + pd.offsets.MonthEnd(0)
+        dias_mes = pd.date_range(ini, fin)
+        real_part = pbase = 0.0
+        for t in dias_mes:
+            if t in dia.index: real_part += float(dia.loc[t])
+            else: pbase += proj_dia(t)
+        n_real = sum(1 for t in dias_mes if t in dia.index)
+        estado = "REAL" if n_real >= len(dias_mes) else ("EN CURSO" if n_real > 0 else "PROYECTADO")
+        f_mes = cola_factor * (1 + adj_mes[mth - 1])
+        base_tot = real_part + pbase
+        scn_tot = real_part + pbase * f_mes
+        delta = (scn_tot / base_tot - 1) * 100 if base_tot > 0 else 0.0
+        filas.append({"mes": MESES[mth-1], "estado": estado, "real": int(round(real_part)),
+                      "base": int(round(base_tot)), "escenario": int(round(scn_tot)), "delta": round(delta,1)})
+
+    # Promedios históricos
+    pdow = dia.groupby(idx_dow).mean().reindex(range(7)).fillna(0)
+    NOM7 = ["Lun","Mar","Mié","Jue","Vie","Sáb","Dom"]
+    prom_dow = [{"dia": NOM7[i], "promedio": round(float(pdow.values[i]),1)} for i in range(7)]
+    dia_anio = dia[dia.index.year == anio]
+    sem = dia_anio.resample("W").sum()
+    por_semana = [{"semana": idx.strftime("%Y-%m-%d"), "entrantes": int(v)} for idx, v in sem.items()]
+
+    tb = sum(f["base"] for f in filas); tsc = sum(f["escenario"] for f in filas)
+    return {
+        "ok": True, "vacio": False,
+        "anio": anio, "anios_disponibles": anios_disp,
+        "colas_disponibles": [{"cola": c, "pct": float(share_pct[c])} for c in share.index],
+        "tabla": filas,
+        "totales": {"base": tb, "escenario": tsc, "diferencia": tsc - tb,
+                    "delta_pct": round((tsc/tb - 1)*100, 1) if tb else None},
+        "promedio_dow": prom_dow,
+        "por_semana": por_semana,
+    }
+
+
 @app.get("/dashboard-historico")
 def dashboard_historico(
     x_api_key: str = Header(None),
