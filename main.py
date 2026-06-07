@@ -571,8 +571,8 @@ async def generar_roster(
                 INSERT INTO asignaciones (agente_id, fecha, campana_id, turno_id, hora_inicio, hora_fin, tipo, creado_por)
                 VALUES (:agente_id, :fecha, :campana_id, :turno_id, :hora_inicio, :hora_fin, :tipo, :creado_por)
             """)
-            for k in range(0, len(filas), 500):
-                conn.execute(ins, filas[k:k+500])
+            for k in range(0, len(filas), 1000):
+                conn.execute(ins, filas[k:k+1000])
     except Exception as e:
         ejemplo = filas[0] if filas else {}
         raise HTTPException(500, f"Error al escribir asignaciones: {type(e).__name__}: {str(e)[:300]} | ejemplo fila: {ejemplo}")
@@ -601,8 +601,8 @@ async def generar_roster(
                 INSERT INTO breaks (asignacion_id, hora_inicio, duracion_min, tipo)
                 VALUES (:asignacion_id, :hora_inicio, :duracion_min, :tipo)
             """)
-            for k in range(0, len(filas_b), 500):
-                conn.execute(ins_b, filas_b[k:k+500])
+            for k in range(0, len(filas_b), 1000):
+                conn.execute(ins_b, filas_b[k:k+1000])
 
     return {
         "ok": True,
