@@ -563,17 +563,12 @@ async def generar_roster(
     #    INSERT MULTI-FILA con ON CONFLICT: mete muchas filas por sentencia (rápido),
     #    y si una (agente_id, fecha) ya existe, la actualiza SOLO si no está bloqueada.
     #    Así nunca choca con la restricción única y respeta los turnos bloqueados por el WFM.
-    import time as _time
-    _marcas = {}
     try:
-        _t = _time.time()
         # DELETE de las no-bloqueadas
         with engine.begin() as conn:
             conn.execute(text("DELETE FROM asignaciones WHERE campana_id=:c AND fecha>=:i AND fecha<=:f AND (bloqueado IS NULL OR bloqueado = false)"),
                          {"c": int(id_campana), "i": dias_mes[0].date(), "f": dias_mes[-1].date()})
-        _marcas["borrar"] = round(_time.time() - _t, 1)
 
-        _t = _time.time()
         cols = ["agente_id", "fecha", "campana_id", "turno_id", "hora_inicio", "hora_fin", "tipo", "creado_por"]
         conflict = """
             ON CONFLICT (agente_id, fecha) DO UPDATE SET
@@ -597,11 +592,9 @@ async def generar_roster(
                         params[f"{col}{j}"] = f[col]
                 sql = "INSERT INTO asignaciones (" + ", ".join(cols) + ") VALUES " + ", ".join(valores) + conflict
                 conn.execute(text(sql), params)
-        _marcas["insertar"] = round(_time.time() - _t, 1)
     except Exception as e:
         ejemplo = filas[0] if filas else {}
         raise HTTPException(500, f"Error al escribir asignaciones: {type(e).__name__}: {str(e)[:300]} | ejemplo fila: {ejemplo}")
-    print(f"[generar-roster] tiempos escritura: {_marcas}", flush=True)
 
     # 6) Los breaks se generan en un endpoint aparte (/generar-breaks) para que esta
     #    respuesta sea rápida y no exceda el límite de tiempo de Cloudflare/Lovable.
@@ -627,25 +620,18 @@ def generar_breaks(
     """Genera los breaks del mes a partir de las asignaciones ya creadas.
     Se llama DESPUÉS de /generar-roster para repartir el trabajo y no exceder el tiempo límite."""
     check_key(x_api_key)
-    import time as _time
-    _marcas = {}
-    _t0 = _time.time()
     engine = get_engine()
     id_campana = pd.read_sql(text("SELECT id FROM campanas WHERE nombre=:n"),
                              engine, params={"n": campana})["id"][0]
     dias_mes = pd.date_range(f"{mes}-01", pd.Timestamp(f"{mes}-01") + pd.offsets.MonthEnd(0))
-    _marcas["1_conexion_y_campana"] = round(_time.time() - _t0, 1)
 
-    _t = _time.time()
     asg = pd.read_sql(text("""
         SELECT a.id AS asignacion_id, a.hora_inicio, a.hora_fin, ag.pais
         FROM asignaciones a JOIN agentes ag ON ag.id=a.agente_id
         WHERE a.campana_id=:c AND a.tipo='trabajo' AND a.fecha BETWEEN :i AND :f
         ORDER BY a.fecha, a.hora_inicio, a.id
     """), engine, params={"c": int(id_campana), "i": dias_mes[0].date(), "f": dias_mes[-1].date()})
-    _marcas["2_leer_asignaciones"] = round(_time.time() - _t, 1)
 
-    _t = _time.time()
     filas_b = []; contador = defaultdict(int)
     for _, r in asg.iterrows():
         dur = dur_turno(r["hora_inicio"], r["hora_fin"]); idx = contador[r["hora_inicio"]]; contador[r["hora_inicio"]] += 1
@@ -653,21 +639,16 @@ def generar_breaks(
         for bhi, dm, tp in gen(r["hora_inicio"], round(dur), idx):
             filas_b.append({"asignacion_id": int(r["asignacion_id"]),
                             "hora_inicio": str(bhi), "duracion_min": int(dm), "tipo": str(tp)})
-    _marcas["3_calcular_breaks"] = round(_time.time() - _t, 1)
 
     ids = [int(x) for x in asg["asignacion_id"].tolist()]
     try:
-        _t = _time.time()
         # DELETE de los breaks viejos: un solo DELETE por todos los ids (con índice es rápido)
         with engine.begin() as conn:
             if ids:
                 conn.execute(text("DELETE FROM breaks WHERE asignacion_id = ANY(:ids)"), {"ids": ids})
-        _marcas["4_borrar_viejos"] = round(_time.time() - _t, 1)
 
-        _t = _time.time()
-        # INSERT MULTI-FILA: en vez de 7.767 inserts de una fila (lentísimo por la red),
-        # construimos sentencias que meten muchas filas de golpe: VALUES (...),(...),(...)
-        # Eso reduce miles de viajes a la base a solo unas pocas decenas.
+        # INSERT MULTI-FILA: muchas filas por sentencia (VALUES (...),(...),...),
+        # en vez de una fila por viaje. Reduce miles de viajes a la base a unas pocas decenas.
         LOTE = 500
         with engine.begin() as conn:
             for k in range(0, len(filas_b), LOTE):
@@ -682,11 +663,8 @@ def generar_breaks(
                     params[f"t{j}"] = f["tipo"]
                 sql = "INSERT INTO breaks (asignacion_id, hora_inicio, duracion_min, tipo) VALUES " + ", ".join(valores)
                 conn.execute(text(sql), params)
-        _marcas["5_insertar_nuevos"] = round(_time.time() - _t, 1)
     except Exception as e:
         ejemplo = filas_b[0] if filas_b else {}
         raise HTTPException(500, f"Error al escribir breaks: {type(e).__name__}: {str(e)[:300]} | ejemplo: {ejemplo}")
 
-    _marcas["TOTAL"] = round(_time.time() - _t0, 1)
-    print(f"[generar-breaks] tiempos: {_marcas}", flush=True)
-    return {"ok": True, "mes": mes, "breaks": len(filas_b), "tiempos_seg": _marcas}
+    return {"ok": True, "mes": mes, "breaks": len(filas_b)}
