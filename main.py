@@ -560,10 +560,17 @@ async def generar_roster(
     df_asig = pd.DataFrame(filas)
 
     # 5) Cargar asignaciones (limpiar mes antes, PERO conservando las bloqueadas)
+    # 5) Cargar asignaciones (limpiar mes antes, PERO conservando las bloqueadas)
+    #    Todo en UNA transacción: o se escribe completo, o no se toca nada (evita rosters a medias).
+    registros = df_asig.to_dict("records")
     with engine.begin() as conn:
         conn.execute(text("DELETE FROM asignaciones WHERE campana_id=:c AND fecha>=:i AND fecha<=:f AND (bloqueado IS NULL OR bloqueado = false)"),
                      {"c": int(id_campana), "i": dias_mes[0].date(), "f": dias_mes[-1].date()})
-    df_asig.to_sql("asignaciones", engine, if_exists="append", index=False, method="multi", chunksize=500)
+        if registros:
+            conn.execute(text("""
+                INSERT INTO asignaciones (agente_id, fecha, campana_id, turno_id, hora_inicio, hora_fin, tipo, creado_por)
+                VALUES (:agente_id, :fecha, :campana_id, :turno_id, :hora_inicio, :hora_fin, :tipo, :creado_por)
+            """), registros)
 
     # 6) Generar y cargar breaks
     asg = pd.read_sql(text("""
@@ -580,11 +587,15 @@ async def generar_roster(
             filas_b.append({"asignacion_id": int(r["asignacion_id"]), "hora_inicio": bhi, "duracion_min": dm, "tipo": tp})
     df_b = pd.DataFrame(filas_b)
     ids = [int(x) for x in asg["asignacion_id"].tolist()]
+    registros_b = df_b.to_dict("records") if not df_b.empty else []
     with engine.begin() as conn:
         if ids:
             conn.execute(text("DELETE FROM breaks WHERE asignacion_id = ANY(:ids)"), {"ids": ids})
-    if not df_b.empty:
-        df_b.to_sql("breaks", engine, if_exists="append", index=False, method="multi", chunksize=500)
+        if registros_b:
+            conn.execute(text("""
+                INSERT INTO breaks (asignacion_id, hora_inicio, duracion_min, tipo)
+                VALUES (:asignacion_id, :hora_inicio, :duracion_min, :tipo)
+            """), registros_b)
 
     return {
         "ok": True,
