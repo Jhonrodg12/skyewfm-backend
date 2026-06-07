@@ -181,12 +181,15 @@ async def generar_roster(
     # 2) Repartir personas
     id_campana = pd.read_sql(text("SELECT id FROM campanas WHERE nombre=:n"),
                              engine, params={"n": campana})["id"][0]
-    ag = pd.read_sql("SELECT id,nombre,centro,pais,jornada_horas FROM agentes WHERE estado='ACTIVO' ORDER BY id", engine)
+    # Solo agentes MULTISKILL reciben turno del optimizador (backoffice se asigna aparte)
+    ag = pd.read_sql("SELECT id,nombre,centro,pais,jornada_horas,modo FROM agentes WHERE estado='ACTIVO' AND UPPER(modo)='MULTISKILL' ORDER BY id", engine)
     esp = ag[ag["pais"] == "España"].to_dict("records")
     col = ag[ag["pais"] == "Colombia"].to_dict("records")
+    # Perfil de tráfico por hora (turnos que pidió el optimizador) — define dónde arrancan más agentes
     col_t, esp_t = repartidor.demanda_diaria(S)
-    base_col, _, res_col = repartidor.repartir(col, col_t, set(range(7)), "Colombia", True)
-    base_esp, _, res_esp = repartidor.repartir(esp, esp_t, {0, 1, 2, 3, 4}, "España", False)
+    # Repartir TODOS los Multiskill (sin backup), según el perfil de tráfico
+    base_col, res_col = repartidor.repartir_todos(col, col_t, set(range(7)), "Colombia", True)
+    base_esp, res_esp = repartidor.repartir_todos(esp, esp_t, {0, 1, 2, 3, 4}, "España", False)
     base_todos = base_col + base_esp
 
     # 3) Registrar turnos usados
