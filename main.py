@@ -646,10 +646,6 @@ def generar_breaks(
     _marcas["3_calcular_breaks"] = round(_time.time() - _t, 1)
 
     ids = [int(x) for x in asg["asignacion_id"].tolist()]
-    ins_b = text("""
-        INSERT INTO breaks (asignacion_id, hora_inicio, duracion_min, tipo)
-        VALUES (:asignacion_id, :hora_inicio, :duracion_min, :tipo)
-    """)
     try:
         _t = _time.time()
         # DELETE de los breaks viejos: un solo DELETE por todos los ids (con índice es rápido)
@@ -659,11 +655,23 @@ def generar_breaks(
         _marcas["4_borrar_viejos"] = round(_time.time() - _t, 1)
 
         _t = _time.time()
-        # INSERT en lotes grandes dentro de UNA sola conexión reutilizada
-        LOTE = 1000
+        # INSERT MULTI-FILA: en vez de 7.767 inserts de una fila (lentísimo por la red),
+        # construimos sentencias que meten muchas filas de golpe: VALUES (...),(...),(...)
+        # Eso reduce miles de viajes a la base a solo unas pocas decenas.
+        LOTE = 500
         with engine.begin() as conn:
             for k in range(0, len(filas_b), LOTE):
-                conn.execute(ins_b, filas_b[k:k+LOTE])
+                lote = filas_b[k:k+LOTE]
+                valores = []
+                params = {}
+                for j, f in enumerate(lote):
+                    valores.append(f"(:a{j}, :h{j}, :d{j}, :t{j})")
+                    params[f"a{j}"] = f["asignacion_id"]
+                    params[f"h{j}"] = f["hora_inicio"]
+                    params[f"d{j}"] = f["duracion_min"]
+                    params[f"t{j}"] = f["tipo"]
+                sql = "INSERT INTO breaks (asignacion_id, hora_inicio, duracion_min, tipo) VALUES " + ", ".join(valores)
+                conn.execute(text(sql), params)
         _marcas["5_insertar_nuevos"] = round(_time.time() - _t, 1)
     except Exception as e:
         ejemplo = filas_b[0] if filas_b else {}
