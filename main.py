@@ -501,8 +501,23 @@ async def generar_roster(
     # 2) Repartir personas
     id_campana = pd.read_sql(text("SELECT id FROM campanas WHERE nombre=:n"),
                              engine, params={"n": campana})["id"][0]
+
+    dias_mes = pd.date_range(f"{mes}-01", pd.Timestamp(f"{mes}-01") + pd.offsets.MonthEnd(0))
+
+    # --- BLOQUEOS: asignaciones que el WFM marcó como fijas y NO deben recalcularse ---
+    bloq = pd.read_sql(text("""
+        SELECT agente_id, fecha FROM asignaciones
+        WHERE campana_id=:c AND fecha BETWEEN :i AND :f AND bloqueado = true
+    """), engine, params={"c": int(id_campana), "i": dias_mes[0].date(), "f": dias_mes[-1].date()})
+    # set de (agente_id, fecha) bloqueados — esos días no se regeneran
+    dias_bloqueados = set((int(r["agente_id"]), pd.Timestamp(r["fecha"]).date()) for _, r in bloq.iterrows())
+    # agentes con TODO el mes bloqueado salen del reparto automático
+    cont_bloq = bloq.groupby("agente_id").size() if not bloq.empty else pd.Series(dtype=int)
+    agentes_full_bloq = set(int(a) for a, n in cont_bloq.items() if n >= len(dias_mes))
+
     # Solo agentes MULTISKILL reciben turno del optimizador (backoffice se asigna aparte)
     ag = pd.read_sql("SELECT id,nombre,centro,pais,jornada_horas,modo FROM agentes WHERE estado='ACTIVO' AND UPPER(modo)='MULTISKILL' ORDER BY id", engine)
+    ag = ag[~ag["id"].isin(agentes_full_bloq)]  # excluir agentes totalmente bloqueados
     esp = ag[ag["pais"] == "España"].to_dict("records")
     col = ag[ag["pais"] == "Colombia"].to_dict("records")
     # Perfil de tráfico por hora (turnos que pidió el optimizador) — define dónde arrancan más agentes
@@ -513,7 +528,6 @@ async def generar_roster(
     base_todos = base_col + base_esp
 
     # 3) Registrar turnos usados
-    dias_mes = pd.date_range(f"{mes}-01", pd.Timestamp(f"{mes}-01") + pd.offsets.MonthEnd(0))
     horas_usadas = sorted({a["hora_inicio"] for a in base_todos})
     turno_id_por_hora = {}
     with engine.begin() as conn:
@@ -528,12 +542,15 @@ async def generar_roster(
                                  {"n": f"Turno {hora_str} ({largo}h)", "hi": hora_str, "du": largo, "de": f"Optimizador {mes}"}).fetchone()
                 turno_id_por_hora[h] = r[0]
 
-    # 4) Generar asignaciones
+    # 4) Generar asignaciones (saltando los días bloqueados por el WFM)
     filas = []
     for item in base_todos:
         a = item["agente"]; hi = item["hora_inicio"]; libres = item["libres"]
         hora_fin = (hi + largo) % 24; tid = turno_id_por_hora[hi]
         for d in dias_mes:
+            # si ese día de ese agente está bloqueado, no lo regeneramos (se conserva el existente)
+            if (int(a["id"]), d.date()) in dias_bloqueados:
+                continue
             if d.dayofweek in libres:
                 filas.append({"agente_id": int(a["id"]), "fecha": d.date(), "campana_id": int(id_campana),
                               "turno_id": None, "hora_inicio": None, "hora_fin": None, "tipo": "libre", "creado_por": "optimizador-web"})
@@ -542,9 +559,9 @@ async def generar_roster(
                               "turno_id": int(tid), "hora_inicio": f"{hi:02d}:00", "hora_fin": f"{hora_fin:02d}:00", "tipo": "trabajo", "creado_por": "optimizador-web"})
     df_asig = pd.DataFrame(filas)
 
-    # 5) Cargar asignaciones (limpiar mes antes)
+    # 5) Cargar asignaciones (limpiar mes antes, PERO conservando las bloqueadas)
     with engine.begin() as conn:
-        conn.execute(text("DELETE FROM asignaciones WHERE campana_id=:c AND fecha>=:i AND fecha<=:f"),
+        conn.execute(text("DELETE FROM asignaciones WHERE campana_id=:c AND fecha>=:i AND fecha<=:f AND (bloqueado IS NULL OR bloqueado = false)"),
                      {"c": int(id_campana), "i": dias_mes[0].date(), "f": dias_mes[-1].date()})
     df_asig.to_sql("asignaciones", engine, if_exists="append", index=False, method="multi", chunksize=500)
 
