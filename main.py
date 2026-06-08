@@ -1152,3 +1152,116 @@ async def importar_parrilla(
         "ejemplos_dnis_sin_cruzar": sorted(dnis_sin_cruzar)[:20],
         "celdas_no_parseables": celdas_skip,
     }
+
+
+# ============================================================
+#  ADHERENCIA · Fase 4 — Datos para el dashboard
+# ============================================================
+@app.get("/adherencia/opciones")
+def adherencia_opciones(x_api_key: str = Header(None)):
+    """Valores para los filtros del dashboard (rango de fechas, paises, centros)."""
+    check_key(x_api_key)
+    engine = get_engine()
+    r = pd.read_sql(text("SELECT MIN(fecha) AS d, MAX(fecha) AS h FROM adherencia"), engine)
+    if r["d"][0] is None:
+        return {"ok": True, "vacio": True}
+    pc = pd.read_sql(text("""
+        SELECT DISTINCT ag.pais, ag.centro
+        FROM adherencia adh JOIN agentes ag ON ag.id = adh.agente_id
+    """), engine)
+    return {
+        "ok": True, "vacio": False,
+        "desde": str(r["d"][0]), "hasta": str(r["h"][0]),
+        "paises": sorted([str(p) for p in pc["pais"].dropna().unique()]),
+        "centros": sorted([str(c) for c in pc["centro"].dropna().unique()]),
+    }
+
+
+@app.get("/adherencia/dashboard")
+def adherencia_dashboard(
+    x_api_key: str = Header(None),
+    desde: str = None,
+    hasta: str = None,
+    pais: str = None,
+    centro: str = None,
+):
+    """
+    Datos agregados de adherencia para el dashboard, segun filtros.
+    Adherencia y TMO se calculan ponderados por segundos/llamadas (no promedio simple).
+    """
+    check_key(x_api_key)
+    engine = get_engine()
+
+    rango = pd.read_sql(text("SELECT MIN(fecha) AS d, MAX(fecha) AS h FROM adherencia"), engine)
+    if rango["d"][0] is None:
+        return {"ok": True, "vacio": True}
+    d_ini = desde or str(rango["d"][0])
+    d_fin = hasta or str(rango["h"][0])
+
+    cond = "adh.fecha BETWEEN :i AND :f"
+    params = {"i": d_ini, "f": d_fin}
+    if pais:
+        cond += " AND ag.pais = :pais"; params["pais"] = pais
+    if centro:
+        cond += " AND ag.centro = :centro"; params["centro"] = centro
+
+    df = pd.read_sql(text(f"""
+        SELECT adh.agente_id, adh.fecha, adh.seg_programados, adh.seg_adherido,
+               adh.seg_talk, adh.llamadas, ag.nombre, ag.centro, ag.pais
+        FROM adherencia adh
+        JOIN agentes ag ON ag.id = adh.agente_id
+        WHERE {cond}
+    """), engine, params=params)
+
+    if df.empty:
+        return {"ok": True, "vacio": False, "sin_datos_filtro": True,
+                "rango": {"desde": d_ini, "hasta": d_fin}}
+
+    def _adh(g):
+        sp = g["seg_programados"].sum()
+        return round(100.0 * g["seg_adherido"].sum() / sp, 1) if sp > 0 else None
+
+    def _tmo(g):
+        ll = g["llamadas"].sum()
+        return round(g["seg_talk"].sum() / ll, 1) if ll > 0 else None
+
+    kpis = {
+        "adherencia_pct": _adh(df),
+        "tmo_seg": _tmo(df),
+        "llamadas": int(df["llamadas"].sum()),
+        "agentes": int(df["agente_id"].nunique()),
+        "dias": int(df["fecha"].nunique()),
+        "filas": int(len(df)),
+    }
+
+    por_fecha = []
+    for fch, g in df.groupby("fecha"):
+        por_fecha.append({"fecha": str(fch), "adherencia_pct": _adh(g),
+                          "llamadas": int(g["llamadas"].sum()), "tmo_seg": _tmo(g)})
+    por_fecha.sort(key=lambda x: x["fecha"])
+
+    por_agente = []
+    for aid, g in df.groupby("agente_id"):
+        por_agente.append({
+            "agente_id": int(aid), "nombre": str(g["nombre"].iloc[0]),
+            "centro": (None if pd.isna(g["centro"].iloc[0]) else str(g["centro"].iloc[0])),
+            "pais": (None if pd.isna(g["pais"].iloc[0]) else str(g["pais"].iloc[0])),
+            "adherencia_pct": _adh(g), "tmo_seg": _tmo(g),
+            "llamadas": int(g["llamadas"].sum()), "dias": int(g["fecha"].nunique()),
+        })
+    por_agente.sort(key=lambda x: (x["adherencia_pct"] is None, x["adherencia_pct"]))
+
+    por_pais = []
+    for ps, g in df.groupby("pais"):
+        por_pais.append({"pais": str(ps), "adherencia_pct": _adh(g), "tmo_seg": _tmo(g),
+                         "llamadas": int(g["llamadas"].sum()),
+                         "agentes": int(g["agente_id"].nunique())})
+
+    return {
+        "ok": True, "vacio": False,
+        "rango": {"desde": d_ini, "hasta": d_fin},
+        "kpis": kpis,
+        "por_fecha": por_fecha,
+        "por_agente": por_agente,
+        "por_pais": por_pais,
+    }
