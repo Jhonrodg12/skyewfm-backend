@@ -838,3 +838,121 @@ async def acd_importar(
         "logins_sin_cruzar": int(rep["sin_cruzar"][0]),
         "ejemplos_sin_cruzar": sin["login_acd"].tolist(),
     }
+
+
+# ============================================================
+#  ADHERENCIA · Fase 3 — Calcular adherencia (plan vs ACD)
+# ============================================================
+@app.post("/adherencia/calcular")
+def adherencia_calcular(
+    x_api_key: str = Header(None),
+    desde: str = None,   # 'YYYY-MM-DD' opcional; si vacio usa el minimo del ACD
+    hasta: str = None,   # 'YYYY-MM-DD' opcional; si vacio usa el maximo del ACD
+):
+    """
+    Cruza el plan (asignaciones, tipo='trabajo') con la realidad (acd_resumen_diario)
+    por (agente_id, fecha): adherencia v1 (presencia/login), TMO y llamadas.
+    Escribe en la tabla adherencia (upsert por agente_id + fecha).
+    """
+    check_key(x_api_key)
+    engine = get_engine()
+
+    rango = pd.read_sql(text("SELECT MIN(fecha) AS d, MAX(fecha) AS h FROM acd_resumen_diario"), engine)
+    if rango["d"][0] is None:
+        raise HTTPException(400, "No hay datos en acd_resumen_diario. Importa el Excel primero.")
+    d_ini = desde or str(rango["d"][0])
+    d_fin = hasta or str(rango["h"][0])
+
+    # Plan 'trabajo' + realidad ACD cruzados por agente/dia
+    df = pd.read_sql(text("""
+        SELECT a.agente_id, a.fecha, a.hora_inicio, a.hora_fin,
+               d.plataforma, d.seg_login, d.seg_talk_in, d.seg_talk_out,
+               d.seg_hold, d.llamadas_inbound
+        FROM asignaciones a
+        JOIN acd_resumen_diario d
+          ON d.agente_id = a.agente_id AND d.fecha = a.fecha
+        WHERE a.tipo = 'trabajo'
+          AND a.hora_inicio IS NOT NULL AND a.hora_fin IS NOT NULL
+          AND a.fecha BETWEEN :i AND :f
+    """), engine, params={"i": d_ini, "f": d_fin})
+
+    # diagnostico: plan de trabajo SIN dato real (agente con turno pero sin ACD ese dia)
+    gap = pd.read_sql(text("""
+        SELECT COUNT(*) AS n, COUNT(DISTINCT a.agente_id) AS agentes
+        FROM asignaciones a
+        LEFT JOIN acd_resumen_diario d
+          ON d.agente_id = a.agente_id AND d.fecha = a.fecha
+        WHERE a.tipo = 'trabajo'
+          AND a.hora_inicio IS NOT NULL AND a.hora_fin IS NOT NULL
+          AND a.fecha BETWEEN :i AND :f
+          AND d.id IS NULL
+    """), engine, params={"i": d_ini, "f": d_fin})
+
+    if df.empty:
+        return {"ok": True, "vacio": True, "rango": {"desde": d_ini, "hasta": d_fin},
+                "nota": "No hay dias con plan 'trabajo' y dato ACD a la vez en ese rango.",
+                "plan_sin_acd_filas": int(gap["n"][0]), "plan_sin_acd_agentes": int(gap["agentes"][0])}
+
+    filas = []
+    for _, r in df.iterrows():
+        dur_h = dur_turno(r["hora_inicio"], r["hora_fin"])
+        seg_prog = int(round(dur_h * 3600))
+        seg_login = int(r["seg_login"] or 0)
+        seg_adher = min(seg_login, seg_prog) if seg_prog > 0 else 0
+        pct = round(100.0 * seg_adher / seg_prog, 2) if seg_prog > 0 else None
+        seg_talk = int(r["seg_talk_in"] or 0) + int(r["seg_talk_out"] or 0) + int(r["seg_hold"] or 0)
+        llam = int(r["llamadas_inbound"] or 0)
+        tmo = round(seg_talk / llam, 2) if llam > 0 else None
+        filas.append({
+            "agente_id": int(r["agente_id"]),
+            "fecha": pd.Timestamp(r["fecha"]).date(),
+            "plataforma": (str(r["plataforma"]) if r["plataforma"] is not None else None),
+            "seg_programados": seg_prog,
+            "seg_login": seg_login,
+            "seg_adherido": seg_adher,
+            "pct_adherencia": pct,
+            "seg_talk": seg_talk,
+            "llamadas": llam,
+            "tmo_seg": tmo,
+        })
+
+    cols = ["agente_id", "fecha", "plataforma", "seg_programados", "seg_login",
+            "seg_adherido", "pct_adherencia", "seg_talk", "llamadas", "tmo_seg"]
+    actualiza = ", ".join(f"{c}=EXCLUDED.{c}" for c in cols if c not in ("agente_id", "fecha"))
+    conflict = f" ON CONFLICT (agente_id, fecha) DO UPDATE SET {actualiza} "
+
+    LOTE = 500
+    try:
+        with engine.begin() as conn:
+            for k in range(0, len(filas), LOTE):
+                lote = filas[k:k + LOTE]
+                valores = []; params = {}
+                for j, f in enumerate(lote):
+                    valores.append("(" + ", ".join(f":{c}{j}" for c in cols) + ")")
+                    for c in cols:
+                        params[f"{c}{j}"] = f[c]
+                sql = "INSERT INTO adherencia (" + ", ".join(cols) + ") VALUES " + ", ".join(valores) + conflict
+                conn.execute(text(sql), params)
+    except Exception as e:
+        ejemplo = filas[0] if filas else {}
+        raise HTTPException(500, f"Error al escribir adherencia: {type(e).__name__}: {str(e)[:300]} | ejemplo: {ejemplo}")
+
+    resumen = pd.read_sql(text("""
+        SELECT COUNT(*) AS filas, MIN(fecha) AS desde, MAX(fecha) AS hasta,
+               COUNT(DISTINCT agente_id) AS agentes,
+               ROUND(AVG(pct_adherencia), 1) AS adh_media,
+               ROUND(AVG(tmo_seg) FILTER (WHERE tmo_seg IS NOT NULL), 1) AS tmo_medio,
+               SUM(llamadas) AS llamadas
+        FROM adherencia WHERE fecha BETWEEN :i AND :f
+    """), engine, params={"i": d_ini, "f": d_fin})
+
+    return {
+        "ok": True,
+        "rango": {"desde": d_ini, "hasta": d_fin},
+        "filas_calculadas": len(filas),
+        "agentes_cubiertos": int(resumen["agentes"][0]),
+        "adherencia_media_pct": (None if pd.isna(resumen["adh_media"][0]) else float(resumen["adh_media"][0])),
+        "tmo_medio_seg": (None if pd.isna(resumen["tmo_medio"][0]) else float(resumen["tmo_medio"][0])),
+        "llamadas_total": int(resumen["llamadas"][0] or 0),
+        "diagnostico_plan_sin_acd": {"filas": int(gap["n"][0]), "agentes": int(gap["agentes"][0])},
+    }
