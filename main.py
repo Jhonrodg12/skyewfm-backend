@@ -668,3 +668,173 @@ def generar_breaks(
         raise HTTPException(500, f"Error al escribir breaks: {type(e).__name__}: {str(e)[:300]} | ejemplo: {ejemplo}")
 
     return {"ok": True, "mes": mes, "breaks": len(filas_b)}
+
+
+# ============================================================
+#  ADHERENCIA · Fase 2 — Importar resumen diario del ACD
+# ============================================================
+# Mapa: clave logica -> posibles inicios del nombre de columna en el Excel.
+# Se busca por "empieza por" para tolerar nombres recortados (ej "Total Not Ready Ti").
+_ACD_COLS = {
+    "fecha":            ["Fecha"],
+    "plataforma":       ["Plataforma"],
+    "login_acd":        ["Agente"],
+    "logado":           ["Logado"],
+    "deslogado":        ["Deslogado"],
+    "seg_login":        ["Total Login"],
+    "seg_not_ready":    ["Total Not Ready"],
+    "seg_pausa_visual": ["Pausa Visual"],
+    "seg_break":        ["Break"],
+    "seg_formacion":    ["Formacion", "Formaci\u00f3n"],
+    "seg_servicios":    ["Servicios"],
+    "seg_backoffice":   ["BackOffice", "Back Office"],
+    "seg_talk_in":      ["Total Talk Time In"],
+    "seg_talk_out":     ["Total Talk Time Ou"],
+    "seg_hold":         ["Total Hold"],
+    "llamadas_inbound": ["Total Calls Inboun"],
+}
+
+
+def _buscar_col(columnas, prefijos):
+    """Nombre real de la columna que empieza por alguno de los prefijos (ignora may/espacios)."""
+    norm = {c: str(c).strip().lower() for c in columnas}
+    for p in prefijos:
+        pl = p.strip().lower()
+        for real, n in norm.items():
+            if n.startswith(pl):
+                return real
+    return None
+
+
+def _a_int(v):
+    try:
+        if v is None or (isinstance(v, float) and pd.isna(v)):
+            return 0
+        return int(round(float(v)))
+    except Exception:
+        return 0
+
+
+def _a_txt(v):
+    if v is None or (isinstance(v, float) and pd.isna(v)):
+        return None
+    s = str(v).strip()
+    return s if s and s.lower() != "nan" else None
+
+
+def _a_hora(v):
+    """'10:15' o time de Excel -> 'HH:MM:SS' (texto). Vacio -> None."""
+    s = _a_txt(v)
+    if not s:
+        return None
+    partes = s.split(":")
+    try:
+        h = int(partes[0]); m = int(partes[1]) if len(partes) > 1 else 0
+        return f"{h:02d}:{m:02d}:00"
+    except Exception:
+        return None
+
+
+@app.post("/acd/importar")
+async def acd_importar(
+    x_api_key: str = Header(None),
+    archivo: UploadFile = File(...),
+):
+    """
+    Sube el Excel del ACD (resumen por agente/dia) -> acd_resumen_diario.
+    Cabecera en la fila 3, tiempos en segundos. Upsert por (login_acd, fecha).
+    Cruza login_acd con la tabla agentes para rellenar agente_id.
+    """
+    check_key(x_api_key)
+    engine = get_engine()
+
+    file_bytes = await archivo.read()
+    # La cabecera real esta en la fila 3 (indice 2): las 2 primeras son leyenda + vacia.
+    df = pd.read_excel(io.BytesIO(file_bytes), header=2, dtype=str)
+    df.columns = [str(c).strip() for c in df.columns]
+
+    mapa = {clave: _buscar_col(df.columns, prefijos) for clave, prefijos in _ACD_COLS.items()}
+    faltan = [k for k in ("fecha", "login_acd") if mapa[k] is None]
+    if faltan:
+        raise HTTPException(400, f"Faltan columnas obligatorias {faltan}. Columnas vistas: {list(df.columns)}")
+
+    filas = []
+    for _, r in df.iterrows():
+        fecha_s = _a_txt(r.get(mapa["fecha"]))
+        login_s = _a_txt(r.get(mapa["login_acd"]))
+        if not fecha_s or not login_s:
+            continue
+        try:
+            fecha = pd.to_datetime(fecha_s, format="%Y%m%d").date()
+        except Exception:
+            continue
+        filas.append({
+            "fecha": fecha,
+            "plataforma": _a_txt(r.get(mapa["plataforma"])) if mapa["plataforma"] else None,
+            "login_acd": login_s,
+            "logado": _a_hora(r.get(mapa["logado"])) if mapa["logado"] else None,
+            "deslogado": _a_hora(r.get(mapa["deslogado"])) if mapa["deslogado"] else None,
+            "seg_login": _a_int(r.get(mapa["seg_login"])) if mapa["seg_login"] else 0,
+            "seg_not_ready": _a_int(r.get(mapa["seg_not_ready"])) if mapa["seg_not_ready"] else 0,
+            "seg_pausa_visual": _a_int(r.get(mapa["seg_pausa_visual"])) if mapa["seg_pausa_visual"] else 0,
+            "seg_break": _a_int(r.get(mapa["seg_break"])) if mapa["seg_break"] else 0,
+            "seg_formacion": _a_int(r.get(mapa["seg_formacion"])) if mapa["seg_formacion"] else 0,
+            "seg_servicios": _a_int(r.get(mapa["seg_servicios"])) if mapa["seg_servicios"] else 0,
+            "seg_backoffice": _a_int(r.get(mapa["seg_backoffice"])) if mapa["seg_backoffice"] else 0,
+            "seg_talk_in": _a_int(r.get(mapa["seg_talk_in"])) if mapa["seg_talk_in"] else 0,
+            "seg_talk_out": _a_int(r.get(mapa["seg_talk_out"])) if mapa["seg_talk_out"] else 0,
+            "seg_hold": _a_int(r.get(mapa["seg_hold"])) if mapa["seg_hold"] else 0,
+            "llamadas_inbound": _a_int(r.get(mapa["llamadas_inbound"])) if mapa["llamadas_inbound"] else 0,
+        })
+
+    if not filas:
+        raise HTTPException(400, "El Excel no tenia filas validas (revisa que la cabecera este en la fila 3).")
+
+    cols = ["fecha", "plataforma", "login_acd", "logado", "deslogado", "seg_login",
+            "seg_not_ready", "seg_pausa_visual", "seg_break", "seg_formacion", "seg_servicios",
+            "seg_backoffice", "seg_talk_in", "seg_talk_out", "seg_hold", "llamadas_inbound"]
+    actualiza = ", ".join(f"{c}=EXCLUDED.{c}" for c in cols if c not in ("login_acd", "fecha"))
+    conflict = f" ON CONFLICT (login_acd, fecha) DO UPDATE SET {actualiza} "
+
+    LOTE = 500
+    try:
+        with engine.begin() as conn:
+            for k in range(0, len(filas), LOTE):
+                lote = filas[k:k + LOTE]
+                valores = []; params = {}
+                for j, f in enumerate(lote):
+                    valores.append("(" + ", ".join(f":{c}{j}" for c in cols) + ")")
+                    for c in cols:
+                        params[f"{c}{j}"] = f[c]
+                sql = "INSERT INTO acd_resumen_diario (" + ", ".join(cols) + ") VALUES " + ", ".join(valores) + conflict
+                conn.execute(text(sql), params)
+            # Cruce login_acd -> agente_id (ambos a texto para evitar choques de tipo)
+            conn.execute(text("""
+                UPDATE acd_resumen_diario d
+                SET agente_id = a.id
+                FROM agentes a
+                WHERE a.login_acd::text = d.login_acd
+            """))
+    except Exception as e:
+        ejemplo = filas[0] if filas else {}
+        raise HTTPException(500, f"Error al cargar ACD: {type(e).__name__}: {str(e)[:300]} | ejemplo: {ejemplo}")
+
+    rep = pd.read_sql(text("""
+        SELECT COUNT(*) AS filas, MIN(fecha) AS desde, MAX(fecha) AS hasta,
+               COUNT(DISTINCT login_acd) AS logins,
+               COUNT(DISTINCT login_acd) FILTER (WHERE agente_id IS NOT NULL) AS cruzados,
+               COUNT(DISTINCT login_acd) FILTER (WHERE agente_id IS NULL) AS sin_cruzar
+        FROM acd_resumen_diario
+    """), engine)
+    sin = pd.read_sql(text("SELECT DISTINCT login_acd FROM acd_resumen_diario WHERE agente_id IS NULL ORDER BY login_acd LIMIT 30"), engine)
+
+    return {
+        "ok": True,
+        "filas_excel_validas": len(filas),
+        "total_filas_tabla": int(rep["filas"][0]),
+        "rango": {"desde": str(rep["desde"][0]), "hasta": str(rep["hasta"][0])},
+        "logins_distintos": int(rep["logins"][0]),
+        "logins_cruzados": int(rep["cruzados"][0]),
+        "logins_sin_cruzar": int(rep["sin_cruzar"][0]),
+        "ejemplos_sin_cruzar": sin["login_acd"].tolist(),
+    }

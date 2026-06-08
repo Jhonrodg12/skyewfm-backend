@@ -7,3 +7,4 @@ ortools>=9.11
 sqlalchemy>=2.0,<3.0
 psycopg2-binary>=2.9
 python-multipart>=0.0.12
+openpyxl>=3.1,<4.0
