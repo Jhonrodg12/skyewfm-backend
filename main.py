@@ -683,11 +683,13 @@ _ACD_COLS = {
     "deslogado":        ["Deslogado"],
     "seg_login":        ["Total Login"],
     "seg_not_ready":    ["Total Not Ready"],
-    "seg_pausa_visual": ["Pausa Visual"],
-    "seg_break":        ["Break"],
-    "seg_formacion":    ["Formacion", "Formaci\u00f3n"],
-    "seg_servicios":    ["Servicios"],
-    "seg_backoffice":   ["BackOffice", "Back Office"],
+    # Formato nuevo del ACD: Status 1..8 (2=PAUSA,3=DESCANSO,4=FORMACION,5=BO,6=SERVICIO).
+    # Si no estan, cae a los nombres del formato viejo.
+    "seg_pausa_visual": ["Total Status 2", "Pausa Visual"],
+    "seg_break":        ["Total Status 3", "Break"],
+    "seg_formacion":    ["Total Status 4", "Formacion", "Formaci\u00f3n"],
+    "seg_backoffice":   ["Total Status 5", "BackOffice", "Back Office"],   # BO = productivo
+    "seg_servicios":    ["Total Status 6", "Servicios"],
     "seg_talk_in":      ["Total Talk Time In"],
     "seg_talk_out":     ["Total Talk Time Ou"],
     "seg_hold":         ["Total Hold"],
@@ -742,15 +744,23 @@ async def acd_importar(
 ):
     """
     Sube el Excel del ACD (resumen por agente/dia) -> acd_resumen_diario.
-    Cabecera en la fila 3, tiempos en segundos. Upsert por (login_acd, fecha).
-    Cruza login_acd con la tabla agentes para rellenar agente_id.
+    Detecta la cabecera sola (formato nuevo fila 1 con Status 1..8, o viejo fila 3).
+    Tiempos en segundos. Upsert por (login_acd, fecha). Cruza login_acd con agentes.
     """
     check_key(x_api_key)
     engine = get_engine()
 
     file_bytes = await archivo.read()
-    # La cabecera real esta en la fila 3 (indice 2): las 2 primeras son leyenda + vacia.
-    df = pd.read_excel(io.BytesIO(file_bytes), header=2, dtype=str)
+    # Detectar la fila de cabecera: formato nuevo -> fila 1 (indice 0); viejo -> fila 3 (indice 2).
+    df = None
+    for h in (0, 2):
+        tmp = pd.read_excel(io.BytesIO(file_bytes), header=h, dtype=str)
+        cols = [str(c).strip().lower() for c in tmp.columns]
+        if "fecha" in cols and "agente" in cols:
+            df = tmp
+            break
+    if df is None:
+        raise HTTPException(400, "No encuentro la cabecera (columnas 'Fecha'/'Agente') en el Excel.")
     df.columns = [str(c).strip() for c in df.columns]
 
     mapa = {clave: _buscar_col(df.columns, prefijos) for clave, prefijos in _ACD_COLS.items()}
@@ -851,8 +861,8 @@ def adherencia_calcular(
 ):
     """
     Cruza el plan (asignaciones, tipo='trabajo') con la realidad (acd_resumen_diario)
-    por (agente_id, fecha): adherencia v1 (presencia/login), TMO y llamadas.
-    Escribe en la tabla adherencia (upsert por agente_id + fecha).
+    por (agente_id, fecha) y calcula: ADH BRUTA, ADH NETA, UTILIZACION, PRODUCTIVIDAD,
+    INFOE, mas TMO y llamadas. HR PRESENCIA sale del turno. Upsert en adherencia.
     """
     check_key(x_api_key)
     engine = get_engine()
@@ -863,11 +873,11 @@ def adherencia_calcular(
     d_ini = desde or str(rango["d"][0])
     d_fin = hasta or str(rango["h"][0])
 
-    # Plan 'trabajo' + realidad ACD cruzados por agente/dia
     df = pd.read_sql(text("""
         SELECT a.agente_id, a.fecha, a.hora_inicio, a.hora_fin,
-               d.plataforma, d.seg_login, d.seg_talk_in, d.seg_talk_out,
-               d.seg_hold, d.llamadas_inbound
+               d.plataforma, d.seg_login, d.seg_not_ready,
+               d.seg_talk_in, d.seg_talk_out, d.seg_hold,
+               d.seg_backoffice, d.llamadas_inbound
         FROM asignaciones a
         JOIN acd_resumen_diario d
           ON d.agente_id = a.agente_id AND d.fecha = a.fecha
@@ -876,7 +886,6 @@ def adherencia_calcular(
           AND a.fecha BETWEEN :i AND :f
     """), engine, params={"i": d_ini, "f": d_fin})
 
-    # diagnostico: plan de trabajo SIN dato real (agente con turno pero sin ACD ese dia)
     gap = pd.read_sql(text("""
         SELECT COUNT(*) AS n, COUNT(DISTINCT a.agente_id) AS agentes
         FROM asignaciones a
@@ -893,31 +902,43 @@ def adherencia_calcular(
                 "nota": "No hay dias con plan 'trabajo' y dato ACD a la vez en ese rango.",
                 "plan_sin_acd_filas": int(gap["n"][0]), "plan_sin_acd_agentes": int(gap["agentes"][0])}
 
+    def pct(num, den):
+        return round(100.0 * num / den, 2) if den and den > 0 else None
+
     filas = []
     for _, r in df.iterrows():
-        dur_h = dur_turno(r["hora_inicio"], r["hora_fin"])
-        seg_prog = int(round(dur_h * 3600))
+        seg_presencia = int(round(dur_turno(r["hora_inicio"], r["hora_fin"]) * 3600))
         seg_login = int(r["seg_login"] or 0)
-        seg_adher = min(seg_login, seg_prog) if seg_prog > 0 else 0
-        pct = round(100.0 * seg_adher / seg_prog, 2) if seg_prog > 0 else None
-        seg_talk = int(r["seg_talk_in"] or 0) + int(r["seg_talk_out"] or 0) + int(r["seg_hold"] or 0)
+        seg_nr = int(r["seg_not_ready"] or 0)
+        seg_talk = int(r["seg_talk_in"] or 0) + int(r["seg_talk_out"] or 0)
+        seg_hold = int(r["seg_hold"] or 0)
+        seg_bo = int(r["seg_backoffice"] or 0)            # BO = unico estado productivo
+        seg_efectiva = max(seg_login - seg_nr, 0)
+        seg_productiva = seg_talk + seg_bo
         llam = int(r["llamadas_inbound"] or 0)
-        tmo = round(seg_talk / llam, 2) if llam > 0 else None
         filas.append({
             "agente_id": int(r["agente_id"]),
             "fecha": pd.Timestamp(r["fecha"]).date(),
             "plataforma": (str(r["plataforma"]) if r["plataforma"] is not None else None),
-            "seg_programados": seg_prog,
+            "seg_presencia": seg_presencia,
             "seg_login": seg_login,
-            "seg_adherido": seg_adher,
-            "pct_adherencia": pct,
+            "seg_efectiva": seg_efectiva,
+            "seg_productiva": seg_productiva,
             "seg_talk": seg_talk,
+            "seg_hold": seg_hold,
+            "seg_not_ready": seg_nr,
+            "adh_bruta": pct(seg_login, seg_presencia),         # HR Logado / HR Presencia
+            "adh_neta": pct(seg_efectiva, seg_presencia),       # HR Efectiva / HR Presencia
+            "utilizacion": pct(seg_efectiva, seg_login),        # HR Efectiva / HR Logado
+            "productividad": pct(seg_productiva, seg_efectiva), # HR Productiva / HR Efectiva
+            "infoe": pct(seg_productiva, seg_login),            # HR Productiva / HR Logado
             "llamadas": llam,
-            "tmo_seg": tmo,
+            "tmo_seg": (round((seg_talk + seg_hold) / llam, 2) if llam > 0 else None),
         })
 
-    cols = ["agente_id", "fecha", "plataforma", "seg_programados", "seg_login",
-            "seg_adherido", "pct_adherencia", "seg_talk", "llamadas", "tmo_seg"]
+    cols = ["agente_id", "fecha", "plataforma", "seg_presencia", "seg_login", "seg_efectiva",
+            "seg_productiva", "seg_talk", "seg_hold", "seg_not_ready", "adh_bruta", "adh_neta",
+            "utilizacion", "productividad", "infoe", "llamadas", "tmo_seg"]
     actualiza = ", ".join(f"{c}=EXCLUDED.{c}" for c in cols if c not in ("agente_id", "fecha"))
     conflict = f" ON CONFLICT (agente_id, fecha) DO UPDATE SET {actualiza} "
 
@@ -938,22 +959,32 @@ def adherencia_calcular(
         raise HTTPException(500, f"Error al escribir adherencia: {type(e).__name__}: {str(e)[:300]} | ejemplo: {ejemplo}")
 
     resumen = pd.read_sql(text("""
-        SELECT COUNT(*) AS filas, MIN(fecha) AS desde, MAX(fecha) AS hasta,
-               COUNT(DISTINCT agente_id) AS agentes,
-               ROUND(AVG(pct_adherencia), 1) AS adh_media,
-               ROUND(AVG(tmo_seg) FILTER (WHERE tmo_seg IS NOT NULL), 1) AS tmo_medio,
+        SELECT COUNT(*) AS filas, COUNT(DISTINCT agente_id) AS agentes,
+               ROUND(100.0*SUM(seg_login)   /NULLIF(SUM(seg_presencia),0),1) AS adh_bruta,
+               ROUND(100.0*SUM(seg_efectiva)/NULLIF(SUM(seg_presencia),0),1) AS adh_neta,
+               ROUND(100.0*SUM(seg_efectiva)/NULLIF(SUM(seg_login),0),1)     AS utilizacion,
+               ROUND(100.0*SUM(seg_productiva)/NULLIF(SUM(seg_efectiva),0),1) AS productividad,
+               ROUND(100.0*SUM(seg_productiva)/NULLIF(SUM(seg_login),0),1)   AS infoe,
+               ROUND(SUM(seg_talk+seg_hold)::numeric/NULLIF(SUM(llamadas),0),1) AS tmo,
                SUM(llamadas) AS llamadas
         FROM adherencia WHERE fecha BETWEEN :i AND :f
     """), engine, params={"i": d_ini, "f": d_fin})
+    rr = resumen.iloc[0]
+    def fv(x):
+        return None if pd.isna(x) else float(x)
 
     return {
         "ok": True,
         "rango": {"desde": d_ini, "hasta": d_fin},
         "filas_calculadas": len(filas),
-        "agentes_cubiertos": int(resumen["agentes"][0]),
-        "adherencia_media_pct": (None if pd.isna(resumen["adh_media"][0]) else float(resumen["adh_media"][0])),
-        "tmo_medio_seg": (None if pd.isna(resumen["tmo_medio"][0]) else float(resumen["tmo_medio"][0])),
-        "llamadas_total": int(resumen["llamadas"][0] or 0),
+        "agentes_cubiertos": int(rr["agentes"]),
+        "adh_bruta_pct": fv(rr["adh_bruta"]),
+        "adh_neta_pct": fv(rr["adh_neta"]),
+        "utilizacion_pct": fv(rr["utilizacion"]),
+        "productividad_pct": fv(rr["productividad"]),
+        "infoe_pct": fv(rr["infoe"]),
+        "tmo_seg": fv(rr["tmo"]),
+        "llamadas_total": int(rr["llamadas"] or 0),
         "diagnostico_plan_sin_acd": {"filas": int(gap["n"][0]), "agentes": int(gap["agentes"][0])},
     }
 
@@ -1391,3 +1422,101 @@ def agregar_consola(
         "agentes_sin_login_acd": sorted(sin_login),
         "nota": "Para el dia en curso es acumulado hasta ahora; al cerrar la jornada queda completo. Ahora corre /adherencia/calcular.",
     }
+
+
+# ============================================================
+#  ADHERENCIA · Export a Excel (para gerencia)
+# ============================================================
+@app.get("/adherencia/export")
+def adherencia_export(
+    x_api_key: str = Header(None),
+    desde: str = None,
+    hasta: str = None,
+    pais: str = None,
+    centro: str = None,
+    modo: str = None,
+    supervisor: str = None,
+):
+    """Descarga un .xlsx con la adherencia (detalle + resumenes) segun filtros."""
+    check_key(x_api_key)
+    engine = get_engine()
+
+    rango = pd.read_sql(text("SELECT MIN(fecha) AS d, MAX(fecha) AS h FROM adherencia"), engine)
+    if rango["d"][0] is None:
+        raise HTTPException(400, "No hay datos de adherencia. Corre /adherencia/calcular primero.")
+    d_ini = desde or str(rango["d"][0])
+    d_fin = hasta or str(rango["h"][0])
+
+    cond = "adh.fecha BETWEEN :i AND :f"
+    params = {"i": d_ini, "f": d_fin}
+    if pais:       cond += " AND ag.pais = :pais";              params["pais"] = pais
+    if centro:     cond += " AND ag.centro = :centro";          params["centro"] = centro
+    if modo:       cond += " AND ag.modo = :modo";              params["modo"] = modo
+    if supervisor: cond += " AND ag.supervisor_nombre = :sup";  params["sup"] = supervisor
+
+    df = pd.read_sql(text(f"""
+        SELECT adh.fecha, ag.nombre, ag.dni, ag.centro, ag.pais, ag.modo, ag.supervisor_nombre,
+               adh.seg_presencia, adh.seg_login, adh.seg_efectiva, adh.seg_productiva,
+               adh.seg_talk, adh.seg_hold, adh.llamadas, adh.tmo_seg,
+               adh.adh_bruta, adh.adh_neta, adh.utilizacion, adh.productividad, adh.infoe
+        FROM adherencia adh JOIN agentes ag ON ag.id = adh.agente_id
+        WHERE {cond}
+        ORDER BY ag.nombre, adh.fecha
+    """), engine, params=params)
+    if df.empty:
+        raise HTTPException(404, "No hay datos para esos filtros.")
+
+    def kpis(g):
+        sp, sl, se = g["seg_presencia"].sum(), g["seg_login"].sum(), g["seg_efectiva"].sum()
+        spr, ll = g["seg_productiva"].sum(), g["llamadas"].sum()
+        f = lambda n, d: (round(100.0 * n / d, 1) if d > 0 else None)
+        return pd.Series({
+            "HR Presencia": round(sp / 3600, 1), "HR Logado": round(sl / 3600, 1),
+            "HR Efectiva": round(se / 3600, 1), "HR Productiva": round(spr / 3600, 1),
+            "ADH Bruta %": f(sl, sp), "ADH Neta %": f(se, sp), "Utilizacion %": f(se, sl),
+            "Productividad %": f(spr, se), "INFOE %": f(spr, sl),
+            "Llamadas": int(ll),
+            "TMO (mm:ss)": (f"{int((g['seg_talk'].sum()+g['seg_hold'].sum())//ll)//60:02d}:"
+                            f"{int((g['seg_talk'].sum()+g['seg_hold'].sum())//ll)%60:02d}" if ll > 0 else ""),
+            "Dias": g["fecha"].nunique(),
+        })
+
+    # Detalle por agente/dia
+    det = df.copy()
+    det["HR Presencia"] = (det["seg_presencia"] / 3600).round(2)
+    det["HR Logado"] = (det["seg_login"] / 3600).round(2)
+    det["HR Efectiva"] = (det["seg_efectiva"] / 3600).round(2)
+    det["HR Productiva"] = (det["seg_productiva"] / 3600).round(2)
+    detalle = det[["fecha", "nombre", "dni", "centro", "pais", "modo", "supervisor_nombre",
+                   "HR Presencia", "HR Logado", "HR Efectiva", "HR Productiva",
+                   "adh_bruta", "adh_neta", "utilizacion", "productividad", "infoe",
+                   "llamadas", "tmo_seg"]].rename(columns={
+        "fecha": "Fecha", "nombre": "Agente", "dni": "DNI", "centro": "Centro", "pais": "Pais",
+        "modo": "Modo", "supervisor_nombre": "Supervisor", "adh_bruta": "ADH Bruta %",
+        "adh_neta": "ADH Neta %", "utilizacion": "Utilizacion %", "productividad": "Productividad %",
+        "infoe": "INFOE %", "llamadas": "Llamadas", "tmo_seg": "TMO (seg)"})
+
+    res_ag = df.groupby(["nombre", "centro", "pais", "modo", "supervisor_nombre"]).apply(kpis).reset_index()
+    res_ag = res_ag.rename(columns={"nombre": "Agente", "centro": "Centro", "pais": "Pais",
+                                    "modo": "Modo", "supervisor_nombre": "Supervisor"})
+    res_pais = df.groupby("pais").apply(kpis).reset_index().rename(columns={"pais": "Pais"})
+    res_modo = df.groupby("modo").apply(kpis).reset_index().rename(columns={"modo": "Modo"})
+    general = kpis(df).to_frame(name=f"{d_ini} a {d_fin}").reset_index().rename(columns={"index": "Indicador"})
+
+    import io as _io
+    buf = _io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as xw:
+        general.to_excel(xw, sheet_name="Resumen general", index=False)
+        res_ag.to_excel(xw, sheet_name="Por agente", index=False)
+        res_pais.to_excel(xw, sheet_name="Por pais", index=False)
+        res_modo.to_excel(xw, sheet_name="Por modo", index=False)
+        detalle.to_excel(xw, sheet_name="Detalle", index=False)
+    buf.seek(0)
+
+    from fastapi.responses import StreamingResponse
+    nombre = f"adherencia_{d_ini}_a_{d_fin}.xlsx"
+    return StreamingResponse(
+        buf,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f'attachment; filename="{nombre}"'},
+    )
