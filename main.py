@@ -956,3 +956,199 @@ def adherencia_calcular(
         "llamadas_total": int(resumen["llamadas"][0] or 0),
         "diagnostico_plan_sin_acd": {"filas": int(gap["n"][0]), "agentes": int(gap["agentes"][0])},
     }
+
+
+# ============================================================
+#  ADHERENCIA · Fase 3b — Importar parrilla historica -> asignaciones
+# ============================================================
+import re as _re_par
+
+_PAR_LIBRE = {"LIBRE", "DLF", "FEST"}
+_PAR_VAC = {"VAC", "VACACIONES"}
+_PAR_AUS_PREFIJOS = ("BMED", "BMLD", "BAJA", "APNJ", "ANJ", "SUSP", "PER", "PERM",
+                     "PR", "SNT", "SINT")
+
+
+def _par_segmento(seg):
+    """'09:00-18:00' -> (inicio_min, duracion_min). Tolera '.' como ':'. None si no parsea."""
+    seg = seg.strip().replace(".", ":")
+    m = _re_par.match(r"^(\d{1,2}):(\d{2})-(\d{1,2}):(\d{2})$", seg)
+    if not m:
+        return None
+    h1, m1, h2, m2 = map(int, m.groups())
+    if h1 > 23 or h2 > 23 or m1 > 59 or m2 > 59:
+        return None
+    ini = h1 * 60 + m1
+    fin = h2 * 60 + m2
+    dur = fin - ini
+    if dur <= 0:
+        dur += 24 * 60
+    return ini, dur
+
+
+def _par_celda(valor):
+    """
+    Mapea una celda de la parrilla a (tipo, hora_inicio, hora_fin).
+    - turno (incl. partido con '/') -> ('trabajo', 'HH:MM', 'HH:MM')  [ventana = duracion total]
+    - LIBRE/FEST/DLF -> ('libre', None, None)
+    - VAC -> ('vacaciones', None, None)
+    - BMED/BAJA/APNJ/SUSP/PERM... -> ('ausencia', None, None)
+    - vacio -> None (no se inserta) ; no parseable -> 'SKIP'
+    """
+    if valor is None:
+        return None
+    s = str(valor).strip()
+    if not s:
+        return None
+    up = s.upper()
+    if up in _PAR_LIBRE:
+        return ("libre", None, None)
+    if up in _PAR_VAC:
+        return ("vacaciones", None, None)
+    if any(up.startswith(p) for p in _PAR_AUS_PREFIJOS):
+        return ("ausencia", None, None)
+    # turno (uno o varios segmentos separados por '/')
+    primer_ini = None
+    total_dur = 0
+    for seg in s.split("/"):
+        r = _par_segmento(seg)
+        if r is None:
+            return "SKIP"
+        ini, dur = r
+        if primer_ini is None:
+            primer_ini = ini
+        total_dur += dur
+    if primer_ini is None or total_dur <= 0:
+        return "SKIP"
+    hi = f"{(primer_ini // 60) % 24:02d}:{primer_ini % 60:02d}"
+    fin_min = (primer_ini + total_dur) % (24 * 60)
+    hf = f"{fin_min // 60:02d}:{fin_min % 60:02d}"
+    return ("trabajo", hi, hf)
+
+
+def _mes_de_hoja(nombre):
+    n = nombre.strip().lower()
+    if n.startswith("abr"):
+        return 4
+    if n.startswith("may"):
+        return 5
+    if n.startswith("jun") or n.startswith("jum"):
+        return 6
+    return None
+
+
+@app.post("/asignaciones/importar-parrilla")
+async def importar_parrilla(
+    x_api_key: str = Header(None),
+    archivo: UploadFile = File(...),
+    meses: str = "4,5",            # meses a cargar (numero), separados por coma. Junio NO por defecto.
+    campana: str = "Endesa",
+):
+    """
+    Carga una parrilla matricial (1 fila por agente, 1 columna por dia) en asignaciones.
+    Cruza por DNI con la tabla agentes. Por defecto solo abril y mayo (junio ya esta cargado).
+    """
+    check_key(x_api_key)
+    engine = get_engine()
+
+    meses_ok = {int(x) for x in str(meses).split(",") if x.strip().isdigit()}
+    if not meses_ok:
+        raise HTTPException(400, "Parametro 'meses' invalido (ej: '4,5').")
+
+    id_campana = pd.read_sql(text("SELECT id FROM campanas WHERE nombre=:n"),
+                             engine, params={"n": campana})
+    if id_campana.empty:
+        raise HTTPException(400, f"No existe la campana {campana!r}.")
+    id_campana = int(id_campana["id"][0])
+
+    # mapa DNI -> agente_id
+    ag = pd.read_sql(text("SELECT id, dni FROM agentes"), engine)
+    dni2id = {str(d).strip(): int(i) for i, d in zip(ag["id"], ag["dni"]) if d is not None}
+
+    file_bytes = await archivo.read()
+    from openpyxl import load_workbook
+    wb = load_workbook(io.BytesIO(file_bytes), read_only=True, data_only=True)
+
+    ID_COLS = 6          # ESTADO, Transporte, DNI, APELLIDO1, APELLIDO2, NOMBRE
+    COL_DNI = 2
+
+    filas = []
+    dnis_sin_cruzar = set()
+    celdas_skip = 0
+    por_tipo = {"trabajo": 0, "libre": 0, "vacaciones": 0, "ausencia": 0}
+
+    for sn in wb.sheetnames:
+        mes = _mes_de_hoja(sn)
+        if mes is None or mes not in meses_ok:
+            continue
+        ws = wb[sn]
+        rows = list(ws.iter_rows(values_only=True))
+        if not rows:
+            continue
+        header = rows[0]
+        # columnas de fecha de ESTE mes (cabecera tipo datetime y month == mes)
+        cols_fecha = []
+        for ci in range(ID_COLS, len(header)):
+            h = header[ci]
+            if isinstance(h, datetime) and h.month == mes:
+                cols_fecha.append((ci, h.date()))
+        for r in rows[1:]:
+            if len(r) <= COL_DNI or r[COL_DNI] is None:
+                continue
+            dni = str(r[COL_DNI]).strip()
+            aid = dni2id.get(dni)
+            if aid is None:
+                dnis_sin_cruzar.add(dni)
+                continue
+            for ci, fecha in cols_fecha:
+                if ci >= len(r):
+                    continue
+                res = _par_celda(r[ci])
+                if res is None:
+                    continue
+                if res == "SKIP":
+                    celdas_skip += 1
+                    continue
+                tipo, hi, hf = res
+                por_tipo[tipo] = por_tipo.get(tipo, 0) + 1
+                filas.append({
+                    "agente_id": aid, "fecha": fecha, "campana_id": id_campana,
+                    "turno_id": None, "hora_inicio": hi, "hora_fin": hf,
+                    "tipo": tipo, "creado_por": "import-parrilla", "bloqueado": True,
+                })
+
+    if not filas:
+        raise HTTPException(400, f"No se generaron filas. Meses pedidos: {sorted(meses_ok)}. "
+                                 f"DNIs sin cruzar: {len(dnis_sin_cruzar)}.")
+
+    cols = ["agente_id", "fecha", "campana_id", "turno_id", "hora_inicio", "hora_fin",
+            "tipo", "creado_por", "bloqueado"]
+    actualiza = ", ".join(f"{c}=EXCLUDED.{c}" for c in cols if c not in ("agente_id", "fecha"))
+    conflict = f" ON CONFLICT (agente_id, fecha) DO UPDATE SET {actualiza} "
+
+    LOTE = 500
+    try:
+        with engine.begin() as conn:
+            for k in range(0, len(filas), LOTE):
+                lote = filas[k:k + LOTE]
+                valores = []; params = {}
+                for j, f in enumerate(lote):
+                    valores.append("(" + ", ".join(f":{c}{j}" for c in cols) + ")")
+                    for c in cols:
+                        params[f"{c}{j}"] = f[c]
+                sql = "INSERT INTO asignaciones (" + ", ".join(cols) + ") VALUES " + ", ".join(valores) + conflict
+                conn.execute(text(sql), params)
+    except Exception as e:
+        ejemplo = filas[0] if filas else {}
+        raise HTTPException(500, f"Error al escribir asignaciones: {type(e).__name__}: {str(e)[:300]} | ejemplo: {ejemplo}")
+
+    return {
+        "ok": True,
+        "meses_cargados": sorted(meses_ok),
+        "filas_insertadas": len(filas),
+        "por_tipo": por_tipo,
+        "agentes_cruzados": len({f["agente_id"] for f in filas}),
+        "dnis_sin_cruzar": len(dnis_sin_cruzar),
+        "ejemplos_dnis_sin_cruzar": sorted(dnis_sin_cruzar)[:20],
+        "celdas_no_parseables": celdas_skip,
+    }
