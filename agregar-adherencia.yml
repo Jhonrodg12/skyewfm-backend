@@ -1,0 +1,31 @@
+name: Agregar adherencia (consola)
+
+on:
+  schedule:
+    - cron: "59 21 * * *"   # 21:59 UTC = 23:59 Espana en VERANO (CEST)
+    - cron: "59 22 * * *"   # 22:59 UTC = 23:59 Espana en INVIERNO (CET)
+  workflow_dispatch:         # permite ejecutarlo a mano desde la pestana Actions
+
+jobs:
+  agregar:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Calcular fechas (ayer y hoy en UTC)
+        id: f
+        run: |
+          echo "hoy=$(date -u +%F)" >> "$GITHUB_OUTPUT"
+          echo "ayer=$(date -u -d 'yesterday' +%F)" >> "$GITHUB_OUTPUT"
+
+      - name: Agregar eventos de la consola
+        run: |
+          curl -sS --fail \
+            -X POST "https://skyewfm-backend-west.onrender.com/acd/agregar-consola?desde=${{ steps.f.outputs.ayer }}&hasta=${{ steps.f.outputs.hoy }}" \
+            -H "X-API-Key: ${{ secrets.SKYEWFM_API_KEY }}"
+          echo ""
+
+      - name: Recalcular adherencia
+        run: |
+          curl -sS --fail \
+            -X POST "https://skyewfm-backend-west.onrender.com/adherencia/calcular?desde=${{ steps.f.outputs.ayer }}&hasta=${{ steps.f.outputs.hoy }}" \
+            -H "X-API-Key: ${{ secrets.SKYEWFM_API_KEY }}"
+          echo ""
