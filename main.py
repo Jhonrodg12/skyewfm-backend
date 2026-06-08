@@ -903,7 +903,10 @@ def adherencia_calcular(
                 "plan_sin_acd_filas": int(gap["n"][0]), "plan_sin_acd_agentes": int(gap["agentes"][0])}
 
     def pct(num, den):
-        return round(100.0 * num / den, 2) if den and den > 0 else None
+        if not den or den <= 0:
+            return None
+        v = round(100.0 * num / den, 2)
+        return min(v, 999.99)   # acota ruido por denominador pequeno y evita overflow numeric(6,2)
 
     filas = []
     for _, r in df.iterrows():
