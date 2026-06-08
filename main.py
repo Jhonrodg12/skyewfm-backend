@@ -1265,3 +1265,129 @@ def adherencia_dashboard(
         "por_agente": por_agente,
         "por_pais": por_pais,
     }
+
+
+# ============================================================
+#  CONSOLA · Fase 3 — Agregar eventos de la consola -> acd_resumen_diario
+# ============================================================
+def _hora_local(ts, pais):
+    """timestamptz -> 'HH:MM:SS' en la zona del agente. None si no hay valor."""
+    if ts is None or pd.isna(ts):
+        return None
+    t = pd.Timestamp(ts)
+    if t.tzinfo is None:
+        t = t.tz_localize("UTC")
+    tz = "Europe/Madrid" if str(pais) == "España" else "America/Bogota"
+    try:
+        return t.tz_convert(tz).strftime("%H:%M:%S")
+    except Exception:
+        return t.strftime("%H:%M:%S")
+
+
+@app.post("/acd/agregar-consola")
+def agregar_consola(
+    x_api_key: str = Header(None),
+    desde: str = None,   # 'YYYY-MM-DD' opcional; por defecto hoy
+    hasta: str = None,
+):
+    """
+    Resume los eventos de la consola por agente/dia y los escribe en acd_resumen_diario
+    (origen='consola'), para que adherencia los calcule igual que el ACD del Excel.
+    Eventos abiertos (fin NULL) se cuentan hasta ahora. Upsert por (login_acd, fecha).
+    """
+    check_key(x_api_key)
+    engine = get_engine()
+
+    hoy = pd.read_sql(text("SELECT (now() at time zone 'America/Bogota')::date AS d"), engine)["d"][0]
+    d_ini = desde or str(hoy)
+    d_fin = hasta or str(hoy)
+
+    ev = pd.read_sql(text("""
+        SELECT e.agente_id, e.fecha, e.estado,
+               extract(epoch from (coalesce(e.fin, now()) - e.inicio)) AS seg,
+               e.inicio, e.fin
+        FROM eventos_acd e
+        WHERE e.fecha BETWEEN :i AND :f
+    """), engine, params={"i": d_ini, "f": d_fin})
+
+    if ev.empty:
+        return {"ok": True, "vacio": True, "rango": {"desde": d_ini, "hasta": d_fin},
+                "nota": "No hay eventos de consola en ese rango."}
+
+    ev["seg"] = ev["seg"].fillna(0).clip(lower=0).astype(int)
+
+    ag = pd.read_sql(text("SELECT id, login_acd, pais FROM agentes"), engine)
+    login_de = {int(i): (str(l) if l is not None else None) for i, l in zip(ag["id"], ag["login_acd"])}
+    pais_de = {int(i): p for i, p in zip(ag["id"], ag["pais"])}
+
+    NO_READY = {"break", "almuerzo", "descanso", "pausa_visual", "formacion",
+                "no_disponible", "bano", "reunion", "gestion_bo"}
+
+    filas = []
+    sin_login = set()
+    for (aid, fecha), g in ev.groupby(["agente_id", "fecha"]):
+        aid = int(aid)
+        login = login_de.get(aid)
+        if not login:
+            sin_login.add(aid)
+            continue
+        def s(estado):
+            return int(g.loc[g["estado"] == estado, "seg"].sum())
+        filas.append({
+            "fecha": str(fecha),
+            "plataforma": "CONSOLA",
+            "login_acd": login,
+            "agente_id": aid,
+            "logado": _hora_local(g["inicio"].min(), pais_de.get(aid)),
+            "deslogado": _hora_local(g["fin"].max(), pais_de.get(aid)),
+            "seg_login": int(g["seg"].sum()),
+            "seg_not_ready": int(g.loc[g["estado"].isin(NO_READY), "seg"].sum()),
+            "seg_pausa_visual": s("pausa_visual"),
+            "seg_break": s("break"),
+            "seg_formacion": s("formacion"),
+            "seg_servicios": 0,
+            "seg_backoffice": s("gestion_bo"),
+            "seg_talk_in": 0,     # sin telefonia aun
+            "seg_talk_out": 0,
+            "seg_hold": 0,
+            "llamadas_inbound": 0,
+        })
+
+    if not filas:
+        return {"ok": True, "vacio": False, "rango": {"desde": d_ini, "hasta": d_fin},
+                "filas": 0, "agentes_sin_login_acd": sorted(sin_login),
+                "nota": "Hay eventos pero ningun agente con login_acd."}
+
+    cols = ["fecha", "plataforma", "login_acd", "agente_id", "logado", "deslogado", "seg_login",
+            "seg_not_ready", "seg_pausa_visual", "seg_break", "seg_formacion", "seg_servicios",
+            "seg_backoffice", "seg_talk_in", "seg_talk_out", "seg_hold", "llamadas_inbound"]
+    actualiza = ", ".join(f"{c}=EXCLUDED.{c}" for c in cols if c not in ("login_acd", "fecha"))
+    conflict = f" ON CONFLICT (login_acd, fecha) DO UPDATE SET {actualiza} "
+
+    LOTE = 500
+    try:
+        with engine.begin() as conn:
+            for k in range(0, len(filas), LOTE):
+                lote = filas[k:k + LOTE]
+                valores = []; params = {}
+                for j, f in enumerate(lote):
+                    valores.append("(" + ", ".join(f":{c}{j}" for c in cols) + ")")
+                    for c in cols:
+                        params[f"{c}{j}"] = f[c]
+                sql = "INSERT INTO acd_resumen_diario (" + ", ".join(cols) + ") VALUES " + ", ".join(valores) + conflict
+                conn.execute(text(sql), params)
+            conn.execute(text("""
+                UPDATE acd_resumen_diario d SET agente_id = a.id
+                FROM agentes a WHERE a.login_acd::text = d.login_acd AND d.agente_id IS NULL
+            """))
+    except Exception as e:
+        raise HTTPException(500, f"Error al agregar consola: {type(e).__name__}: {str(e)[:300]} | ejemplo: {filas[0]}")
+
+    return {
+        "ok": True,
+        "rango": {"desde": d_ini, "hasta": d_fin},
+        "filas_escritas": len(filas),
+        "agentes": len({f["agente_id"] for f in filas}),
+        "agentes_sin_login_acd": sorted(sin_login),
+        "nota": "Para el dia en curso es acumulado hasta ahora; al cerrar la jornada queda completo. Ahora corre /adherencia/calcular.",
+    }
