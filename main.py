@@ -1523,3 +1523,155 @@ def adherencia_export(
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         headers={"Content-Disposition": f'attachment; filename="{nombre}"'},
     )
+
+
+# ============================================================
+#  CRM · Importar base de contactos (xlsx/csv) -> crm_contactos
+# ============================================================
+@app.post("/crm/importar")
+async def crm_importar(
+    x_api_key: str = Header(None),
+    archivo: UploadFile = File(...),
+    campana: str = "Endesa",
+):
+    """Sube una base de contactos (xlsx o csv). Columnas conocidas -> campos; el resto -> datos_extra (jsonb)."""
+    check_key(x_api_key)
+    engine = get_engine()
+    import json as _json
+
+    raw = await archivo.read()
+    nombre_arch = (archivo.filename or "").lower()
+    if nombre_arch.endswith(".csv"):
+        df = pd.read_csv(io.BytesIO(raw), dtype=str)
+    else:
+        df = pd.read_excel(io.BytesIO(raw), dtype=str)
+    df.columns = [str(c).strip() for c in df.columns]
+
+    cc = pd.read_sql(text("SELECT id FROM campanas WHERE nombre=:n"), engine, params={"n": campana})
+    id_camp = int(cc["id"][0]) if not cc.empty else None
+
+    conocidas = {"nombre", "documento", "telefono", "telefono2", "email", "direccion", "ciudad"}
+    real = {c.lower(): c for c in df.columns}
+    extra_cols = [c for c in df.columns if c.lower() not in conocidas]
+
+    def val(r, key):
+        c = real.get(key)
+        if c is None:
+            return None
+        v = r.get(c)
+        if v is None or (isinstance(v, float) and pd.isna(v)):
+            return None
+        s = str(v).strip()
+        return s if s and s.lower() != "nan" else None
+
+    filas = []
+    for _, r in df.iterrows():
+        extra = {}
+        for c in extra_cols:
+            v = r.get(c)
+            if v is not None and not (isinstance(v, float) and pd.isna(v)):
+                s = str(v).strip()
+                if s and s.lower() != "nan":
+                    extra[c] = s
+        filas.append({
+            "nombre": val(r, "nombre"), "documento": val(r, "documento"),
+            "telefono": val(r, "telefono"), "telefono2": val(r, "telefono2"),
+            "email": val(r, "email"), "direccion": val(r, "direccion"), "ciudad": val(r, "ciudad"),
+            "campana_id": id_camp, "estado": "pendiente",
+            "datos_extra": (_json.dumps(extra, ensure_ascii=False) if extra else None),
+        })
+    if not filas:
+        raise HTTPException(400, "El archivo no tenia filas.")
+
+    cols = ["nombre", "documento", "telefono", "telefono2", "email", "direccion", "ciudad",
+            "campana_id", "estado", "datos_extra"]
+    LOTE = 500
+    insertadas = 0
+    try:
+        with engine.begin() as conn:
+            for k in range(0, len(filas), LOTE):
+                lote = filas[k:k + LOTE]
+                valores = []; params = {}
+                for j, f in enumerate(lote):
+                    ph = []
+                    for c in cols:
+                        ph.append(f"cast(:{c}{j} as jsonb)" if c == "datos_extra" else f":{c}{j}")
+                        params[f"{c}{j}"] = f[c]
+                    valores.append("(" + ", ".join(ph) + ")")
+                sql = "INSERT INTO crm_contactos (" + ", ".join(cols) + ") VALUES " + ", ".join(valores)
+                conn.execute(text(sql), params)
+                insertadas += len(lote)
+    except Exception as e:
+        raise HTTPException(500, f"Error al importar contactos: {type(e).__name__}: {str(e)[:300]} | ejemplo: {filas[0]}")
+
+    return {"ok": True, "contactos_importados": insertadas,
+            "columnas_extra_a_datos_extra": extra_cols, "campana": campana}
+
+
+# ============================================================
+#  Agentes · Importar horas/salario por Excel (cruza por dni)
+# ============================================================
+@app.post("/agentes/importar-horas")
+async def agentes_importar_horas(
+    x_api_key: str = Header(None),
+    archivo: UploadFile = File(...),
+):
+    """Sube xlsx/csv con columna 'dni' y 'horas_semanales' y/o 'salario_mensual'. Actualiza agentes por dni."""
+    check_key(x_api_key)
+    engine = get_engine()
+    raw = await archivo.read()
+    nombre = (archivo.filename or "").lower()
+    if nombre.endswith(".csv"):
+        df = pd.read_csv(io.BytesIO(raw), dtype=str)
+    else:
+        df = pd.read_excel(io.BytesIO(raw), dtype=str)
+    df.columns = [str(c).strip().lower() for c in df.columns]
+
+    if "dni" not in df.columns:
+        raise HTTPException(400, "El archivo debe tener una columna 'dni'.")
+    tiene_h = "horas_semanales" in df.columns
+    tiene_s = "salario_mensual" in df.columns
+    if not tiene_h and not tiene_s:
+        raise HTTPException(400, "El archivo debe tener 'horas_semanales' y/o 'salario_mensual'.")
+
+    def num(v):
+        if v is None:
+            return None
+        s = str(v).strip().replace(".", "").replace(",", ".") if False else str(v).strip().replace(",", ".")
+        if s == "" or s.lower() == "nan":
+            return None
+        try:
+            return float(s)
+        except Exception:
+            return None
+
+    filas = []
+    for _, r in df.iterrows():
+        dni = str(r.get("dni")).strip() if r.get("dni") is not None else None
+        if not dni or dni.lower() == "nan":
+            continue
+        filas.append({
+            "dni": dni,
+            "h": num(r.get("horas_semanales")) if tiene_h else None,
+            "s": num(r.get("salario_mensual")) if tiene_s else None,
+        })
+    if not filas:
+        raise HTTPException(400, "No se encontraron filas con dni.")
+
+    valores = []; params = {}
+    for j, f in enumerate(filas):
+        valores.append(f"(:dni{j}, cast(:h{j} as numeric), cast(:s{j} as numeric))")
+        params[f"dni{j}"] = f["dni"]; params[f"h{j}"] = f["h"]; params[f"s{j}"] = f["s"]
+    sql = f"""
+        update agentes a set
+          horas_semanales = coalesce(v.h, a.horas_semanales),
+          salario_mensual = coalesce(v.s, a.salario_mensual)
+        from (values {", ".join(valores)}) as v(dni, h, s)
+        where a.dni = v.dni
+    """
+    with engine.begin() as conn:
+        res = conn.execute(text(sql), params)
+        actualizados = res.rowcount or 0
+
+    return {"ok": True, "filas_archivo": len(filas), "agentes_actualizados": actualizados,
+            "sin_cruce": len(filas) - actualizados}
