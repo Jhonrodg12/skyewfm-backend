@@ -1703,15 +1703,28 @@ def nomina_calcular(
         if u in ("ES", "ESP", "ESPANA", "ESPAÑA"): return "ES"
         return u
 
-    ag = pd.read_sql(text("select id, pais, salario_mensual from agentes"), engine)
-    info = {int(r.id): (norm_pais(r.pais), (float(r.salario_mensual) if pd.notna(r.salario_mensual) else None))
+    def _cu(c):
+        if c is None:
+            return None
+        s = str(c).strip().upper()
+        return s if s and s != "NAN" else None
+
+    ag = pd.read_sql(text("select id, pais, salario_mensual, centro from agentes"), engine)
+    info = {int(r.id): (norm_pais(r.pais),
+                        (float(r.salario_mensual) if pd.notna(r.salario_mensual) else None),
+                        _cu(r.centro))
             for r in ag.itertuples()}
 
-    fe = pd.read_sql(text("select fecha, pais from festivos"), engine)
-    festset = {}
+    fe = pd.read_sql(text("select fecha, pais, centro from festivos"), engine)
+    fest_pais = {}    # festivos de todo el país (centro nulo)
+    fest_centro = {}  # festivos por centro: (pais, centro) -> set(fechas)
     for r in fe.itertuples():
         d = r.fecha if isinstance(r.fecha, _date) else pd.to_datetime(r.fecha).date()
-        festset.setdefault(norm_pais(r.pais), set()).add(d)
+        p = norm_pais(r.pais); c = _cu(r.centro)
+        if c is None:
+            fest_pais.setdefault(p, set()).add(d)
+        else:
+            fest_centro.setdefault((p, c), set()).add(d)
 
     asg = pd.read_sql(text("""
         select agente_id, fecha, hora_inicio, hora_fin, tipo, pago
@@ -1738,7 +1751,7 @@ def nomina_calcular(
     filas = []
     for r in asg.itertuples():
         aid = int(r.agente_id)
-        pais, salario = info.get(aid, ("", None))
+        pais, salario, centro = info.get(aid, ("", None, None))
         fecha = r.fecha if isinstance(r.fecha, _date) else pd.to_datetime(r.fecha).date()
         tipo = (r.tipo or "").strip()
         pago = bool(r.pago) if r.pago is not None else True
@@ -1770,7 +1783,8 @@ def nomina_calcular(
             h_total = (seg_e - cur).total_seconds() / 3600.0
             h_dia = overlap_h(cur, seg_e, ws, we)
             h_noc = max(0.0, h_total - h_dia)
-            es_fest = (D.weekday() == 6) or (D in festset.get(pais, set()))
+            es_fest = (D.weekday() == 6) or (D in fest_pais.get(pais, set())) \
+                or (centro is not None and D in fest_centro.get((pais, centro), set()))
             if es_fest:
                 base["h_festiva_diurna"] += h_dia; base["h_festiva_nocturna"] += h_noc
                 if pais == "CO" and salario:
