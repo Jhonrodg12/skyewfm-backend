@@ -1675,3 +1675,119 @@ async def agentes_importar_horas(
 
     return {"ok": True, "filas_archivo": len(filas), "agentes_actualizados": actualizados,
             "sin_cruce": len(filas) - actualizados}
+
+
+# ============================================================
+#  Nómina · Calcular horas y recargos por rango -> nomina_dia
+# ============================================================
+@app.post("/nomina/calcular")
+def nomina_calcular(
+    desde: str,
+    hasta: str,
+    x_api_key: str = Header(None),
+):
+    """Calcula nomina_dia (horas + recargos) para el rango [desde, hasta]. Borra y recalcula ese rango.
+    CO: franja nocturna 19-06 y $ (valor_hora = salario/240, festivo 80/90/100 según fecha).
+    ES: franja nocturna 22-06, solo horas (sin $)."""
+    check_key(x_api_key)
+    engine = get_engine()
+    from datetime import datetime, timedelta, date as _date, time as _time
+
+    datetime.strptime(desde, "%Y-%m-%d"); datetime.strptime(hasta, "%Y-%m-%d")  # valida formato
+
+    ag = pd.read_sql(text("select id, pais, salario_mensual from agentes"), engine)
+    info = {int(r.id): ((r.pais or ""), (float(r.salario_mensual) if pd.notna(r.salario_mensual) else None))
+            for r in ag.itertuples()}
+
+    fe = pd.read_sql(text("select fecha, pais from festivos"), engine)
+    festset = {}
+    for r in fe.itertuples():
+        d = r.fecha if isinstance(r.fecha, _date) else pd.to_datetime(r.fecha).date()
+        festset.setdefault(r.pais, set()).add(d)
+
+    asg = pd.read_sql(text("""
+        select agente_id, fecha, hora_inicio, hora_fin, tipo, pago
+        from asignaciones where fecha between :d and :h
+    """), engine, params={"d": desde, "h": hasta})
+
+    DIV = 240.0
+    def factor_festivo(d):
+        if d >= _date(2027, 7, 1): return 1.00
+        if d >= _date(2026, 7, 1): return 0.90
+        if d >= _date(2025, 7, 1): return 0.80
+        return 0.75
+
+    def overlap_h(s, e, ws, we):
+        lo = max(s, ws); hi = min(e, we)
+        return max(0.0, (hi - lo).total_seconds()) / 3600.0
+
+    def to_time(x):
+        if isinstance(x, _time): return x
+        s = str(x)
+        parts = s.split(":")
+        return _time(int(parts[0]), int(parts[1]), int(parts[2]) if len(parts) > 2 else 0)
+
+    filas = []
+    for r in asg.itertuples():
+        aid = int(r.agente_id)
+        pais, salario = info.get(aid, ("", None))
+        fecha = r.fecha if isinstance(r.fecha, _date) else pd.to_datetime(r.fecha).date()
+        tipo = (r.tipo or "").strip()
+        pago = bool(r.pago) if r.pago is not None else True
+        base = dict(agente_id=aid, fecha=fecha.isoformat(), tipo=tipo, pago=pago,
+                    horas_prog=0.0, h_diurna_ord=0.0, h_nocturna=0.0,
+                    h_festiva_diurna=0.0, h_festiva_nocturna=0.0,
+                    val_rec_nocturno=0.0, val_rec_festivo=0.0, val_rec_noct_festivo=0.0)
+        es_trabajo = (tipo == "trabajo") and (r.hora_inicio is not None) and (r.hora_fin is not None)
+        if not es_trabajo:
+            filas.append(base); continue
+
+        ti = to_time(r.hora_inicio); tf = to_time(r.hora_fin)
+        start = datetime.combine(fecha, ti); end = datetime.combine(fecha, tf)
+        if end <= start: end += timedelta(days=1)
+        base["horas_prog"] = round((end - start).total_seconds() / 3600.0, 4)
+
+        day_end_hour = 19 if pais == "CO" else 22
+        cur = start
+        while cur < end:
+            D = cur.date()
+            seg_e = min(end, datetime.combine(D + timedelta(days=1), _time(0, 0)))
+            ws = datetime.combine(D, _time(6, 0)); we = datetime.combine(D, _time(day_end_hour, 0))
+            h_total = (seg_e - cur).total_seconds() / 3600.0
+            h_dia = overlap_h(cur, seg_e, ws, we)
+            h_noc = max(0.0, h_total - h_dia)
+            es_fest = (D.weekday() == 6) or (D in festset.get(pais, set()))
+            if es_fest:
+                base["h_festiva_diurna"] += h_dia; base["h_festiva_nocturna"] += h_noc
+                if pais == "CO" and salario:
+                    vh = salario / DIV; ff = factor_festivo(D)
+                    base["val_rec_festivo"] += h_dia * vh * ff
+                    base["val_rec_noct_festivo"] += h_noc * vh * (0.35 + ff)
+            else:
+                base["h_diurna_ord"] += h_dia; base["h_nocturna"] += h_noc
+                if pais == "CO" and salario:
+                    base["val_rec_nocturno"] += h_noc * (salario / DIV) * 0.35
+            cur = seg_e
+
+        for k in ["h_diurna_ord", "h_nocturna", "h_festiva_diurna", "h_festiva_nocturna"]:
+            base[k] = round(base[k], 4)
+        for k in ["val_rec_nocturno", "val_rec_festivo", "val_rec_noct_festivo"]:
+            base[k] = round(base[k], 2)
+        filas.append(base)
+
+    cols = ["agente_id", "fecha", "tipo", "pago", "horas_prog", "h_diurna_ord", "h_nocturna",
+            "h_festiva_diurna", "h_festiva_nocturna", "val_rec_nocturno", "val_rec_festivo", "val_rec_noct_festivo"]
+    with engine.begin() as conn:
+        conn.execute(text("delete from nomina_dia where fecha between :d and :h"), {"d": desde, "h": hasta})
+        LOTE = 500
+        for k in range(0, len(filas), LOTE):
+            lote = filas[k:k + LOTE]
+            vals = []; params = {}
+            for j, f in enumerate(lote):
+                vals.append("(" + ",".join(f":{c}{j}" for c in cols) + ")")
+                for c in cols:
+                    params[f"{c}{j}"] = f[c]
+            conn.execute(text("insert into nomina_dia (" + ",".join(cols) + ") values " + ",".join(vals)), params)
+
+    return {"ok": True, "rango": [desde, hasta], "filas_calculadas": len(filas),
+            "agentes": len(set(f["agente_id"] for f in filas))}
