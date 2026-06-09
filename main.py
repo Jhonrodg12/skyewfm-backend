@@ -1972,8 +1972,9 @@ async def vacaciones_importar(
             continue
         aid, camp = cruce
         fa = row[7]
+        turno = str(row[4]).strip().upper() if row[4] not in (None, "") else None
         if isinstance(fa, datetime):
-            altas.append({"aid": aid, "fa": fa.date().isoformat()})
+            altas.append({"aid": aid, "fa": fa.date().isoformat(), "turno": turno})
         for v in row[13:40]:
             if isinstance(v, datetime):
                 vacs.append({"aid": aid, "fecha": v.date().isoformat(), "camp": camp})
@@ -2003,11 +2004,12 @@ async def vacaciones_importar(
         if altas:
             vals = []; params = {}
             for j, a in enumerate(altas):
-                vals.append(f"(:a{j}, cast(:f{j} as date))")
-                params[f"a{j}"] = a["aid"]; params[f"f{j}"] = a["fa"]
+                vals.append(f"(:a{j}, cast(:f{j} as date), :t{j})")
+                params[f"a{j}"] = a["aid"]; params[f"f{j}"] = a["fa"]; params[f"t{j}"] = a["turno"]
             conn.execute(text(
-                "update agentes g set fecha_alta = v.fa from (values " + ",".join(vals) +
-                ") as v(aid, fa) where g.id = v.aid"), params)
+                "update agentes g set fecha_alta = v.fa, turno = coalesce(v.turno, g.turno) "
+                "from (values " + ",".join(vals) +
+                ") as v(aid, fa, turno) where g.id = v.aid"), params)
         # convertir trabajo/libre/ausencia de ese día en vacaciones
         if convertir:
             conn.execute(text(
