@@ -1,0 +1,26 @@
+name: Recalcular Nómina
+
+# Recalcula nomina_dia sobre una ventana móvil (mes anterior + mes siguiente)
+# cada noche, para reflejar cambios en la parrilla y novedades sin correrlo a mano.
+
+on:
+  schedule:
+    - cron: '30 23 * * *'   # 23:30 UTC todos los días (~18:30 Colombia / 00:30 España)
+  workflow_dispatch:          # permite ejecutarlo manualmente desde la pestaña Actions
+
+jobs:
+  recalcular:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Calcular ventana móvil de nómina
+        env:
+          API: https://skyewfm-backend-west.onrender.com
+          KEY: ${{ secrets.SKYEWFM_API_KEY }}
+        run: |
+          DESDE=$(date -u -d '60 days ago' +%F)
+          HASTA=$(date -u -d '31 days' +%F)
+          echo "Recalculando nómina: $DESDE  ->  $HASTA"
+          curl -sS -X POST "$API/nomina/calcular?desde=$DESDE&hasta=$HASTA" \
+               -H "X-API-Key: $KEY" \
+               --max-time 300 --retry 2 --retry-delay 30 \
+               -w "\nHTTP %{http_code}\n"
