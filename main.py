@@ -1692,6 +1692,8 @@ def nomina_calcular(
     check_key(x_api_key)
     engine = get_engine()
     from datetime import datetime, timedelta, date as _date, time as _time
+    from zoneinfo import ZoneInfo
+    TZ_MAD = ZoneInfo("Europe/Madrid"); TZ_BOG = ZoneInfo("America/Bogota")
 
     datetime.strptime(desde, "%Y-%m-%d"); datetime.strptime(hasta, "%Y-%m-%d")  # valida formato
 
@@ -1746,6 +1748,12 @@ def nomina_calcular(
         start = datetime.combine(fecha, ti); end = datetime.combine(fecha, tf)
         if end <= start: end += timedelta(days=1)
         base["horas_prog"] = round((end - start).total_seconds() / 3600.0, 4)
+
+        # Las horas vienen en hora de Madrid. Para agentes CO se convierten a hora de Bogotá
+        # (maneja verano/invierno automáticamente) y se clasifican en hora local colombiana.
+        if pais == "CO":
+            start = start.replace(tzinfo=TZ_MAD).astimezone(TZ_BOG).replace(tzinfo=None)
+            end   = end.replace(tzinfo=TZ_MAD).astimezone(TZ_BOG).replace(tzinfo=None)
 
         day_end_hour = 19 if pais == "CO" else 22
         cur = start
