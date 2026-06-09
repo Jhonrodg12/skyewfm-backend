@@ -1819,3 +1819,106 @@ def nomina_calcular(
 
     return {"ok": True, "rango": [desde, hasta], "filas_calculadas": len(filas),
             "agentes": len(set(f["agente_id"] for f in filas))}
+
+
+# ============================================================
+#  Vacaciones · Calcular saldos por año de servicio -> vacaciones_saldo
+# ============================================================
+@app.post("/vacaciones/calcular")
+def vacaciones_calcular(x_api_key: str = Header(None)):
+    """Calcula el saldo de vacaciones por agente según su año de servicio (aniversario de fecha_alta).
+    CO: 15 hábiles (excluye domingos y festivos). ES: 23 laborables (excluye sáb, dom y festivos).
+    Días tomados = asignaciones tipo='vacaciones' dentro del periodo (incluye programadas a futuro)."""
+    check_key(x_api_key)
+    engine = get_engine()
+    from datetime import datetime, timedelta, date as _date
+    from zoneinfo import ZoneInfo
+
+    hoy = datetime.now(ZoneInfo("America/Bogota")).date()
+
+    def norm_pais(p):
+        u = (p or "").strip().upper()
+        if u in ("CO", "COL", "COLOMBIA"): return "CO"
+        if u in ("ES", "ESP", "ESPANA", "ESPAÑA"): return "ES"
+        return u
+
+    def _cu(c):
+        if c is None: return None
+        s = str(c).strip().upper()
+        return s if s and s != "NAN" else None
+
+    def aniversario(fa, anio):
+        try:
+            return fa.replace(year=anio)
+        except ValueError:
+            return fa.replace(year=anio, month=2, day=28)  # 29-feb -> 28-feb
+
+    ag = pd.read_sql(text("select id, pais, centro, fecha_alta, vacaciones_anuales from agentes"), engine)
+
+    fe = pd.read_sql(text("select fecha, pais, centro from festivos"), engine)
+    fest_pais, fest_centro = {}, {}
+    for r in fe.itertuples():
+        d = r.fecha if isinstance(r.fecha, _date) else pd.to_datetime(r.fecha).date()
+        p = norm_pais(r.pais); c = _cu(r.centro)
+        (fest_pais.setdefault(p, set()) if c is None else fest_centro.setdefault((p, c), set())).add(d)
+
+    av = pd.read_sql(text("select agente_id, fecha from asignaciones where tipo = 'vacaciones'"), engine)
+    vac_por_agente = {}
+    for r in av.itertuples():
+        d = r.fecha if isinstance(r.fecha, _date) else pd.to_datetime(r.fecha).date()
+        vac_por_agente.setdefault(int(r.agente_id), []).append(d)
+
+    def es_festivo(d, pais, centro):
+        return (d in fest_pais.get(pais, set())) or (centro is not None and d in fest_centro.get((pais, centro), set()))
+
+    filas = []
+    for r in ag.itertuples():
+        aid = int(r.id)
+        pais = norm_pais(r.pais); centro = _cu(r.centro)
+        fa = r.fecha_alta if isinstance(r.fecha_alta, _date) else (pd.to_datetime(r.fecha_alta).date() if pd.notna(r.fecha_alta) else None)
+        anuales = float(r.vacaciones_anuales) if pd.notna(r.vacaciones_anuales) else None
+        if fa is None or anuales is None:
+            continue
+
+        aniv = aniversario(fa, hoy.year)
+        periodo_inicio = aniv if aniv <= hoy else aniversario(fa, hoy.year - 1)
+        periodo_fin = aniversario(periodo_inicio, periodo_inicio.year + 1) - timedelta(days=1)
+
+        dias_periodo = (periodo_fin - periodo_inicio).days + 1
+        dias_transc = (min(hoy, periodo_fin) - periodo_inicio).days + 1
+        causado = round(anuales * dias_transc / dias_periodo, 1)
+
+        tomados = 0
+        for d in vac_por_agente.get(aid, []):
+            if not (periodo_inicio <= d <= periodo_fin):
+                continue
+            if pais == "CO":
+                if d.weekday() == 6 or es_festivo(d, pais, centro):  # domingo o festivo
+                    continue
+            else:  # ES: laborables -> excluye sábado, domingo y festivos
+                if d.weekday() >= 5 or es_festivo(d, pais, centro):
+                    continue
+            tomados += 1
+
+        filas.append(dict(
+            agente_id=aid, periodo_inicio=periodo_inicio.isoformat(), periodo_fin=periodo_fin.isoformat(),
+            unidad=("hábiles" if pais == "CO" else "laborables"),
+            cupo_anual=anuales, causado=causado, tomados=tomados,
+            saldo_disponible=round(causado - tomados, 1), pendiente_cupo=round(anuales - tomados, 1),
+        ))
+
+    cols = ["agente_id", "periodo_inicio", "periodo_fin", "unidad", "cupo_anual",
+            "causado", "tomados", "saldo_disponible", "pendiente_cupo"]
+    with engine.begin() as conn:
+        conn.execute(text("delete from vacaciones_saldo"))
+        LOTE = 500
+        for k in range(0, len(filas), LOTE):
+            lote = filas[k:k + LOTE]
+            vals = []; params = {}
+            for j, f in enumerate(lote):
+                vals.append("(" + ",".join(f":{c}{j}" for c in cols) + ")")
+                for c in cols:
+                    params[f"{c}{j}"] = f[c]
+            conn.execute(text("insert into vacaciones_saldo (" + ",".join(cols) + ") values " + ",".join(vals)), params)
+
+    return {"ok": True, "agentes": len(filas), "fecha_referencia": hoy.isoformat()}
