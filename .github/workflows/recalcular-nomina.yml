@@ -24,3 +24,13 @@ jobs:
                -H "X-API-Key: $KEY" \
                --max-time 300 --retry 2 --retry-delay 30 \
                -w "\nHTTP %{http_code}\n"
+
+      - name: Recalcular saldos de vacaciones
+        env:
+          API: https://skyewfm-backend-west.onrender.com
+          KEY: ${{ secrets.SKYEWFM_API_KEY }}
+        run: |
+          curl -sS -X POST "$API/vacaciones/calcular" \
+               -H "X-API-Key: $KEY" \
+               --max-time 300 --retry 2 --retry-delay 30 \
+               -w "\nHTTP %{http_code}\n"
