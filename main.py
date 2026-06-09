@@ -1697,15 +1697,21 @@ def nomina_calcular(
 
     datetime.strptime(desde, "%Y-%m-%d"); datetime.strptime(hasta, "%Y-%m-%d")  # valida formato
 
+    def norm_pais(p):
+        u = (p or "").strip().upper()
+        if u in ("CO", "COL", "COLOMBIA"): return "CO"
+        if u in ("ES", "ESP", "ESPANA", "ESPAÑA"): return "ES"
+        return u
+
     ag = pd.read_sql(text("select id, pais, salario_mensual from agentes"), engine)
-    info = {int(r.id): ((r.pais or ""), (float(r.salario_mensual) if pd.notna(r.salario_mensual) else None))
+    info = {int(r.id): (norm_pais(r.pais), (float(r.salario_mensual) if pd.notna(r.salario_mensual) else None))
             for r in ag.itertuples()}
 
     fe = pd.read_sql(text("select fecha, pais from festivos"), engine)
     festset = {}
     for r in fe.itertuples():
         d = r.fecha if isinstance(r.fecha, _date) else pd.to_datetime(r.fecha).date()
-        festset.setdefault(r.pais, set()).add(d)
+        festset.setdefault(norm_pais(r.pais), set()).add(d)
 
     asg = pd.read_sql(text("""
         select agente_id, fecha, hora_inicio, hora_fin, tipo, pago
