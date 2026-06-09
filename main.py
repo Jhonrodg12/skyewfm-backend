@@ -1880,13 +1880,19 @@ def vacaciones_calcular(x_api_key: str = Header(None)):
         if fa is None or anuales is None:
             continue
 
-        aniv = aniversario(fa, hoy.year)
-        periodo_inicio = aniv if aniv <= hoy else aniversario(fa, hoy.year - 1)
-        periodo_fin = aniversario(periodo_inicio, periodo_inicio.year + 1) - timedelta(days=1)
-
-        dias_periodo = (periodo_fin - periodo_inicio).days + 1
-        dias_transc = (min(hoy, periodo_fin) - periodo_inicio).days + 1
-        causado = round(anuales * dias_transc / dias_periodo, 1)
+        if pais == "ES":
+            # España: año calendario, cupo completo disponible desde el 1 de enero
+            periodo_inicio = _date(hoy.year, 1, 1)
+            periodo_fin = _date(hoy.year, 12, 31)
+            causado = anuales
+        else:
+            # Colombia: año de servicio (aniversario de fecha_alta), causado proporcional
+            aniv = aniversario(fa, hoy.year)
+            periodo_inicio = aniv if aniv <= hoy else aniversario(fa, hoy.year - 1)
+            periodo_fin = aniversario(periodo_inicio, periodo_inicio.year + 1) - timedelta(days=1)
+            dias_periodo = (periodo_fin - periodo_inicio).days + 1
+            dias_transc = (min(hoy, periodo_fin) - periodo_inicio).days + 1
+            causado = round(anuales * dias_transc / dias_periodo, 1)
 
         tomados = 0
         for d in vac_por_agente.get(aid, []):
@@ -1922,3 +1928,106 @@ def vacaciones_calcular(x_api_key: str = Header(None)):
             conn.execute(text("insert into vacaciones_saldo (" + ",".join(cols) + ") values " + ",".join(vals)), params)
 
     return {"ok": True, "agentes": len(filas), "fecha_referencia": hoy.isoformat()}
+
+
+# ============================================================
+#  Vacaciones · Importar plantilla (hoja APROBADAS) -> fecha_alta + asignaciones
+# ============================================================
+@app.post("/vacaciones/importar")
+async def vacaciones_importar(
+    x_api_key: str = Header(None),
+    archivo: UploadFile = File(...),
+    hoja: str = "APROBADAS",
+):
+    """Lee la plantilla de vacaciones (hoja APROBADAS): col B=DNI, H=FECHA ANTIGÜEDAD,
+    N..AN=fechas aprobadas. Actualiza agentes.fecha_alta y carga las fechas como
+    asignaciones tipo='vacaciones' (si ese día había 'trabajo', lo convierte)."""
+    check_key(x_api_key)
+    engine = get_engine()
+    from openpyxl import load_workbook
+    from datetime import datetime, date as _date
+
+    raw = await archivo.read()
+    try:
+        wb = load_workbook(io.BytesIO(raw), read_only=True, data_only=True)
+    except Exception as e:
+        raise HTTPException(400, f"No pude abrir el Excel: {type(e).__name__}. Si tiene contraseña de archivo, quítala y vuelve a subirlo.")
+    if hoja not in wb.sheetnames:
+        raise HTTPException(400, f"No existe la hoja '{hoja}'. Hojas: {wb.sheetnames}")
+    ws = wb[hoja]
+
+    ag = pd.read_sql(text("select id, dni, campana_id from agentes"), engine)
+    por_dni = {str(r.dni).strip().upper(): (int(r.id), (int(r.campana_id) if pd.notna(r.campana_id) else None))
+               for r in ag.itertuples() if r.dni is not None}
+
+    altas, vacs, sin_cruce = [], [], []
+    for row in ws.iter_rows(min_row=3, max_col=40, values_only=True):
+        dni = row[1]
+        if dni in (None, ""):
+            continue
+        dni = str(dni).strip().upper()
+        cruce = por_dni.get(dni)
+        if cruce is None:
+            sin_cruce.append(dni)
+            continue
+        aid, camp = cruce
+        fa = row[7]
+        if isinstance(fa, datetime):
+            altas.append({"aid": aid, "fa": fa.date().isoformat()})
+        for v in row[13:40]:
+            if isinstance(v, datetime):
+                vacs.append({"aid": aid, "fecha": v.date().isoformat(), "camp": camp})
+
+    if not altas and not vacs:
+        raise HTTPException(400, "No encontré datos (¿la hoja tiene el formato esperado?).")
+
+    existentes = pd.read_sql(text("select id, agente_id, fecha, tipo from asignaciones"), engine)
+    mapa = {}
+    for r in existentes.itertuples():
+        f = r.fecha if isinstance(r.fecha, _date) else pd.to_datetime(r.fecha).date()
+        mapa[(int(r.agente_id), f.isoformat())] = (int(r.id), (r.tipo or "").strip())
+
+    nuevos, convertir, ya_estaban = [], [], 0
+    for v in vacs:
+        key = (v["aid"], v["fecha"])
+        ex = mapa.get(key)
+        if ex is None:
+            nuevos.append(v)
+        elif ex[1] == "vacaciones":
+            ya_estaban += 1
+        else:
+            convertir.append(ex[0])
+
+    with engine.begin() as conn:
+        # fecha_alta real
+        if altas:
+            vals = []; params = {}
+            for j, a in enumerate(altas):
+                vals.append(f"(:a{j}, cast(:f{j} as date))")
+                params[f"a{j}"] = a["aid"]; params[f"f{j}"] = a["fa"]
+            conn.execute(text(
+                "update agentes g set fecha_alta = v.fa from (values " + ",".join(vals) +
+                ") as v(aid, fa) where g.id = v.aid"), params)
+        # convertir trabajo/libre/ausencia de ese día en vacaciones
+        if convertir:
+            conn.execute(text(
+                "update asignaciones set tipo='vacaciones', hora_inicio=null, hora_fin=null, pago=true "
+                "where id = any(:ids)"), {"ids": convertir})
+        # insertar las que no existían
+        LOTE = 500
+        for k in range(0, len(nuevos), LOTE):
+            lote = nuevos[k:k + LOTE]
+            vals = []; params = {}
+            for j, n in enumerate(lote):
+                vals.append(f"(:a{j}, cast(:f{j} as date), 'vacaciones', true, :c{j}, 'import_vacaciones')")
+                params[f"a{j}"] = n["aid"]; params[f"f{j}"] = n["fecha"]; params[f"c{j}"] = n["camp"]
+            conn.execute(text(
+                "insert into asignaciones (agente_id, fecha, tipo, pago, campana_id, creado_por) values "
+                + ",".join(vals)), params)
+
+    return {"ok": True, "hoja": hoja,
+            "fechas_alta_actualizadas": len(altas),
+            "vacaciones_insertadas": len(nuevos),
+            "convertidas_de_otro_tipo": len(convertir),
+            "ya_existian": ya_estaban,
+            "dnis_sin_cruce": sorted(set(sin_cruce))}
