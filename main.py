@@ -2202,6 +2202,18 @@ async def agentes_importar(
             campana_creada = False
         id_camp = int(camp[0])
 
+        # Si la campaña es nueva, clonar las tipificaciones marcadas como plantilla
+        if campana_creada:
+            ya = conn.execute(text(
+                "select count(*) from crm_tipificaciones where campana_id = :c"), {"c": id_camp}).fetchone()
+            if ya is None or int(ya[0]) == 0:
+                conn.execute(text("""
+                    insert into crm_tipificaciones (nombre, activo, orden, campana_id, es_plantilla)
+                    select nombre, activo, orden, :c, false
+                    from crm_tipificaciones
+                    where es_plantilla = true
+                """), {"c": id_camp})
+
         existentes = {str(x[0]).strip().upper(): int(x[1]) for x in
                       conn.execute(text("select dni, id from agentes where dni is not null")).fetchall()}
         nuevos = [f for f in filas if f["dni"] not in existentes]
@@ -2745,3 +2757,36 @@ async def planeacion_export(
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         headers={"Content-Disposition": f'attachment; filename="{nombre}"'},
     )
+
+
+# ============================================================
+#  Tipificaciones · clonar plantilla a una campaña existente
+# ============================================================
+@app.post("/tipificaciones/clonar-plantilla")
+async def tipificaciones_clonar_plantilla(
+    x_api_key: str = Header(None),
+    campana: str = Form(...),
+    solo_si_vacia: bool = Form(True),
+):
+    """Copia las tipificaciones marcadas como plantilla (es_plantilla=true) a la campaña indicada.
+    Por defecto solo lo hace si la campaña aún no tiene tipificaciones propias."""
+    check_key(x_api_key)
+    engine = get_engine()
+    cid = _id_campana(engine, campana)
+    if cid is None:
+        raise HTTPException(400, f"La campaña '{campana}' no existe.")
+    with engine.begin() as conn:
+        if solo_si_vacia:
+            ya = conn.execute(text(
+                "select count(*) from crm_tipificaciones where campana_id = :c"), {"c": cid}).fetchone()
+            if ya and int(ya[0]) > 0:
+                return {"ok": True, "campana": campana, "clonadas": 0, "motivo": "ya tenía tipificaciones"}
+        res = conn.execute(text("""
+            insert into crm_tipificaciones (nombre, activo, orden, campana_id, es_plantilla)
+            select nombre, activo, orden, :c, false
+            from crm_tipificaciones
+            where es_plantilla = true
+            returning id
+        """), {"c": cid})
+        n = len(res.fetchall())
+    return {"ok": True, "campana": campana, "clonadas": n}
