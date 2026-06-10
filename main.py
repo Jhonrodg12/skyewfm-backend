@@ -2195,8 +2195,21 @@ async def agentes_importar(
     with engine.begin() as conn:
         camp = conn.execute(text("select id from campanas where nombre = :n"), {"n": campana}).fetchone()
         if camp is None:
+            # Deducir el tipo de país de la campaña según los agentes que se suben
+            paises = set(f["pais"] for f in filas if f["pais"])
+            tiene_es = "España" in paises
+            tiene_co = "Colombia" in paises
+            if tiene_es and tiene_co:
+                ptipo = "MIXTA"
+            elif tiene_es:
+                ptipo = "ES"
+            elif tiene_co:
+                ptipo = "CO"
+            else:
+                ptipo = "MIXTA"
             camp = conn.execute(text(
-                "insert into campanas (nombre) values (:n) returning id"), {"n": campana}).fetchone()
+                "insert into campanas (nombre, pais_tipo) values (:n, :pt) returning id"),
+                {"n": campana, "pt": ptipo}).fetchone()
             campana_creada = True
         else:
             campana_creada = False
