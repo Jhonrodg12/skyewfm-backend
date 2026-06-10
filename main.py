@@ -2458,13 +2458,19 @@ async def call_capacity(
             cap_cache_real[ag_real] = _capacidad_intervalo(ag_real, aht, paciencia, nda_obj=nda_obj)
         if ag_plan not in cap_cache_plan:
             cap_cache_plan[ag_plan] = _capacidad_intervalo(ag_plan, aht, paciencia, nda_obj=nda_obj)
-        cap_real = min(cap_cache_real[ag_real], round(vol))
-        cap_plan = min(cap_cache_plan[ag_plan], round(vol))
+        cap_real_max = cap_cache_real[ag_real]            # capacidad real (sin topar)
+        cap_plan_max = cap_cache_plan[ag_plan]
+        cap_real = min(cap_real_max, round(vol))          # capacidad efectiva (topada a pronosticadas)
+        cap_plan = min(cap_plan_max, round(vol))
         filas.append({
             "fecha": str(f), "intervalo": h, "pronosticadas": round(vol),
-            "agentes_real": ag_real, "capacidad_real": cap_real,
+            "agentes_real": ag_real,
+            "capacidad_real_max": cap_real_max, "capacidad_real": cap_real,
+            "holgura_real": cap_real_max - round(vol),    # + sobra capacidad, - falta
             "deficit_real": round(vol) - cap_real,
-            "agentes_plan": ag_plan, "capacidad_plan": cap_plan,
+            "agentes_plan": ag_plan,
+            "capacidad_plan_max": cap_plan_max, "capacidad_plan": cap_plan,
+            "holgura_plan": cap_plan_max - round(vol),
             "deficit_plan": round(vol) - cap_plan,
         })
 
@@ -2475,17 +2481,21 @@ async def call_capacity(
         por_dia.append({
             "fecha": f,
             "pronosticadas": int(g["pronosticadas"].sum()),
+            "capacidad_real_max": int(g["capacidad_real_max"].sum()),
             "capacidad_real": int(g["capacidad_real"].sum()),
+            "capacidad_plan_max": int(g["capacidad_plan_max"].sum()),
             "capacidad_plan": int(g["capacidad_plan"].sum()),
-            "deficit_real": int(g["pronosticadas"].sum() - g["capacidad_real"].sum()),
-            "deficit_plan": int(g["pronosticadas"].sum() - g["capacidad_plan"].sum()),
+            "holgura_real": int(g["capacidad_real_max"].sum() - g["pronosticadas"].sum()),
+            "holgura_plan": int(g["capacidad_plan_max"].sum() - g["pronosticadas"].sum()),
         })
 
     return {"ok": True, "campana": campana, "mes": mes,
             "por_intervalo": filas, "por_dia": por_dia,
             "totales": {
                 "pronosticadas": int(df["pronosticadas"].sum()),
+                "capacidad_real_max": int(df["capacidad_real_max"].sum()),
                 "capacidad_real": int(df["capacidad_real"].sum()),
+                "capacidad_plan_max": int(df["capacidad_plan_max"].sum()),
                 "capacidad_plan": int(df["capacidad_plan"].sum()),
             }}
 
