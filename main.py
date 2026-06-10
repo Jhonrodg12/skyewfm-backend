@@ -501,6 +501,38 @@ async def planeacion(
     presentes = S["te"] + S["tc"]
     en_nomina = _m.ceil(presentes / (1 - absentismo)) if absentismo < 1 else presentes
 
+    # Guardar los parámetros usados + resumen del resultado para esta campaña+mes
+    cid_save = _id_campana(get_engine(), campana)
+    if cid_save is not None:
+        try:
+            with get_engine().begin() as conn:
+                conn.execute(text("""
+                    insert into campana_parametros
+                      (campana_id, mes, aht, sla, asa, occ, utl, esp_max, largo, nda_obj,
+                       paciencia, absentismo, estructura,
+                       res_volumen, res_espana, res_colombia, res_presentes, res_en_nomina,
+                       calculado_en, actualizado_en)
+                    values
+                      (:cid, :mes, :aht, :sla, :asa, :occ, :utl, :esp_max, :largo, :nda_obj,
+                       :paciencia, :absentismo, :estructura,
+                       :rv, :re, :rc, :rp, :rn, now(), now())
+                    on conflict (campana_id, mes) do update set
+                      aht=excluded.aht, sla=excluded.sla, asa=excluded.asa, occ=excluded.occ,
+                      utl=excluded.utl, esp_max=excluded.esp_max, largo=excluded.largo,
+                      nda_obj=excluded.nda_obj, paciencia=excluded.paciencia,
+                      absentismo=excluded.absentismo, estructura=excluded.estructura,
+                      res_volumen=excluded.res_volumen, res_espana=excluded.res_espana,
+                      res_colombia=excluded.res_colombia, res_presentes=excluded.res_presentes,
+                      res_en_nomina=excluded.res_en_nomina,
+                      calculado_en=now(), actualizado_en=now()
+                """), {"cid": cid_save, "mes": mes, "aht": aht, "sla": sla, "asa": asa,
+                       "occ": occ, "utl": utl, "esp_max": esp_max, "largo": largo,
+                       "nda_obj": nda_obj, "paciencia": paciencia, "absentismo": absentismo,
+                       "estructura": estructura, "rv": int(S["total"]), "re": int(S["te"]),
+                       "rc": int(S["tc"]), "rp": int(presentes), "rn": int(en_nomina)})
+        except Exception:
+            pass  # si falla el guardado del resumen, no rompemos el cálculo
+
     return {
         "ok": True,
         "mes": mes,
@@ -2229,3 +2261,161 @@ async def agentes_importar(
 
     return {"ok": True, "campana": campana, "campana_creada": campana_creada,
             "agentes_creados": len(nuevos), "agentes_actualizados": len(upd)}
+
+
+# ============================================================
+#  Parámetros de planeación por campaña + mes
+# ============================================================
+@app.get("/campana-parametros")
+def campana_parametros_get(
+    x_api_key: str = Header(None),
+    campana: str = None,
+    mes: str = None,
+):
+    """Devuelve los parámetros y el último resultado guardado para una campaña+mes.
+    Si no hay nada guardado, devuelve parametros vacío (el frontend los pone en 0)."""
+    check_key(x_api_key)
+    engine = get_engine()
+    cid = _id_campana(engine, campana)
+    if cid is None or not mes:
+        return {"ok": True, "existe": False, "parametros": {}, "resultado": None}
+    row = pd.read_sql(text(
+        "SELECT parametros, resultado, calculado_en FROM campana_parametros "
+        "WHERE campana_id=:c AND mes=:m"), engine, params={"c": cid, "m": mes})
+    if row.empty:
+        return {"ok": True, "existe": False, "parametros": {}, "resultado": None}
+    import json as _json
+    par = row["parametros"][0]; res = row["resultado"][0]
+    if isinstance(par, str): par = _json.loads(par)
+    if isinstance(res, str) and res: res = _json.loads(res)
+    return {"ok": True, "existe": True, "parametros": par, "resultado": res,
+            "calculado_en": str(row["calculado_en"][0]) if row["calculado_en"][0] is not None else None}
+
+
+def _guardar_parametros(engine, campana, mes, parametros: dict, resultado=None):
+    """Upsert de parámetros (y opcionalmente resultado) de una campaña+mes."""
+    cid = _id_campana(engine, campana)
+    if cid is None or not mes:
+        return
+    import json as _json
+    with engine.begin() as conn:
+        if resultado is not None:
+            conn.execute(text("""
+                INSERT INTO campana_parametros (campana_id, mes, parametros, resultado, calculado_en, actualizado_en)
+                VALUES (:c, :m, cast(:p as jsonb), cast(:r as jsonb), now(), now())
+                ON CONFLICT (campana_id, mes) DO UPDATE SET
+                  parametros = EXCLUDED.parametros, resultado = EXCLUDED.resultado,
+                  calculado_en = now(), actualizado_en = now()
+            """), {"c": cid, "m": mes, "p": _json.dumps(parametros), "r": _json.dumps(resultado)})
+        else:
+            conn.execute(text("""
+                INSERT INTO campana_parametros (campana_id, mes, parametros, actualizado_en)
+                VALUES (:c, :m, cast(:p as jsonb), now())
+                ON CONFLICT (campana_id, mes) DO UPDATE SET
+                  parametros = EXCLUDED.parametros, actualizado_en = now()
+            """), {"c": cid, "m": mes, "p": _json.dumps(parametros)})
+
+
+@app.post("/campana-parametros")
+async def campana_parametros_set(
+    x_api_key: str = Header(None),
+    campana: str = Form(...),
+    mes: str = Form(...),
+    parametros: str = Form(...),   # JSON con los parámetros
+):
+    """Guarda (solo) los parámetros de una campaña+mes, sin recalcular."""
+    check_key(x_api_key)
+    import json as _json
+    engine = get_engine()
+    try:
+        par = _json.loads(parametros)
+    except Exception:
+        raise HTTPException(400, "El campo 'parametros' debe ser JSON válido.")
+    _guardar_parametros(engine, campana, mes, par)
+    return {"ok": True, "campana": campana, "mes": mes, "guardado": True}
+
+
+# ============================================================
+#  Parámetros de planeación por campaña + mes
+# ============================================================
+@app.get("/campana-parametros")
+def campana_parametros_get(
+    x_api_key: str = Header(None),
+    campana: str = None,
+    mes: str = None,
+):
+    """Devuelve los parámetros guardados y el resumen del último cálculo de una campaña+mes.
+    Si no hay nada guardado, devuelve existe=False (el frontend muestra los campos en blanco/0)."""
+    check_key(x_api_key)
+    engine = get_engine()
+    cid = _id_campana(engine, campana)
+    if cid is None or not mes:
+        return {"ok": True, "existe": False}
+    row = pd.read_sql(text("""
+        select aht, sla, asa, occ, utl, esp_max, largo, nda_obj, paciencia, absentismo, estructura,
+               res_volumen, res_espana, res_colombia, res_presentes, res_en_nomina, calculado_en
+        from campana_parametros where campana_id=:c and mes=:m
+    """), engine, params={"c": cid, "m": mes})
+    if row.empty:
+        return {"ok": True, "existe": False}
+    r = row.iloc[0]
+    def _n(v):
+        return None if pd.isna(v) else (float(v) if isinstance(v, float) else v)
+    return {
+        "ok": True, "existe": True,
+        "parametros": {
+            "aht": _n(r["aht"]), "sla": _n(r["sla"]), "asa": _n(r["asa"]), "occ": _n(r["occ"]),
+            "utl": _n(r["utl"]), "esp_max": _n(r["esp_max"]), "largo": _n(r["largo"]),
+            "nda_obj": _n(r["nda_obj"]), "paciencia": _n(r["paciencia"]),
+            "absentismo": _n(r["absentismo"]), "estructura": r["estructura"],
+        },
+        "resumen": {
+            "volumen": _n(r["res_volumen"]), "espana": _n(r["res_espana"]),
+            "colombia": _n(r["res_colombia"]), "presentes": _n(r["res_presentes"]),
+            "en_nomina": _n(r["res_en_nomina"]),
+            "calculado_en": (None if pd.isna(r["calculado_en"]) else str(r["calculado_en"])),
+        },
+    }
+
+
+@app.post("/campana-parametros")
+async def campana_parametros_set(
+    x_api_key: str = Header(None),
+    campana: str = Form(...),
+    mes: str = Form(...),
+    aht: int = Form(None),
+    sla: float = Form(None),
+    asa: int = Form(None),
+    occ: float = Form(None),
+    utl: float = Form(None),
+    esp_max: int = Form(None),
+    largo: int = Form(None),
+    nda_obj: float = Form(None),
+    paciencia: int = Form(None),
+    absentismo: float = Form(None),
+    estructura: str = Form("mixto"),
+):
+    """Guarda (sin calcular) los parámetros que el usuario coloca para una campaña+mes."""
+    check_key(x_api_key)
+    engine = get_engine()
+    cid = _id_campana(engine, campana)
+    if cid is None:
+        raise HTTPException(400, f"La campaña '{campana}' no existe.")
+    with engine.begin() as conn:
+        conn.execute(text("""
+            insert into campana_parametros
+              (campana_id, mes, aht, sla, asa, occ, utl, esp_max, largo, nda_obj,
+               paciencia, absentismo, estructura, actualizado_en)
+            values
+              (:cid, :mes, :aht, :sla, :asa, :occ, :utl, :esp_max, :largo, :nda_obj,
+               :paciencia, :absentismo, :estructura, now())
+            on conflict (campana_id, mes) do update set
+              aht=excluded.aht, sla=excluded.sla, asa=excluded.asa, occ=excluded.occ,
+              utl=excluded.utl, esp_max=excluded.esp_max, largo=excluded.largo,
+              nda_obj=excluded.nda_obj, paciencia=excluded.paciencia,
+              absentismo=excluded.absentismo, estructura=excluded.estructura,
+              actualizado_en=now()
+        """), {"cid": cid, "mes": mes, "aht": aht, "sla": sla, "asa": asa, "occ": occ,
+               "utl": utl, "esp_max": esp_max, "largo": largo, "nda_obj": nda_obj,
+               "paciencia": paciencia, "absentismo": absentismo, "estructura": estructura})
+    return {"ok": True, "campana": campana, "mes": mes, "guardado": True}
