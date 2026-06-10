@@ -459,6 +459,7 @@ async def planeacion(
     estructura: str = Form("mixto"),
     absentismo: float = Form(0.15),
     campana: str = Form("Endesa"),
+    ajuste_pct: float = Form(0.0),   # % de ajuste de volumen (ej. 10 = +10%, -5 = -5%)
 ):
     """Corre el optimizador y devuelve datos para graficar SIN escribir en la base."""
     check_key(x_api_key)
@@ -467,7 +468,8 @@ async def planeacion(
     else:
         eng = get_engine()
         file_bytes = _historico_a_csv_bytes(eng, _id_campana(eng, campana))
-    largo_df = motor.largo_desde_historico(file_bytes, mes, "Nacional España", 4, 6, 0.0, mixto=False)
+    ajuste = (ajuste_pct or 0.0) / 100.0
+    largo_df = motor.largo_desde_historico(file_bytes, mes, "Nacional España", 4, 6, ajuste, mixto=False)
     S = motor.dimension_roster(largo_df, aht, sla, asa, occ, utl, esp_max, largo,
                                nda_obj, paciencia, estructura)
     turnos = motor.turnos_dict(S, largo)
@@ -566,6 +568,7 @@ async def generar_roster(
     nda_obj: float = Form(0.96),
     paciencia: int = Form(90),
     estructura: str = Form("mixto"),
+    ajuste_pct: float = Form(0.0),
 ):
     check_key(x_api_key)
     engine = get_engine()
@@ -575,7 +578,8 @@ async def generar_roster(
         file_bytes = await archivo.read()
     else:
         file_bytes = _historico_a_csv_bytes(engine, _id_campana(engine, campana))
-    largo_df = motor.largo_desde_historico(file_bytes, mes, "Nacional España", 4, 6, 0.0, mixto=False)
+    ajuste = (ajuste_pct or 0.0) / 100.0
+    largo_df = motor.largo_desde_historico(file_bytes, mes, "Nacional España", 4, 6, ajuste, mixto=False)
     S = motor.dimension_roster(largo_df, aht, sla, asa, occ, utl, esp_max, largo,
                                nda_obj, paciencia, estructura)
 
@@ -2347,3 +2351,274 @@ async def campana_parametros_set(
                "utl": utl, "esp_max": esp_max, "largo": largo, "nda_obj": nda_obj,
                "paciencia": paciencia, "absentismo": absentismo, "estructura": estructura})
     return {"ok": True, "campana": campana, "mes": mes, "guardado": True}
+
+
+# ============================================================
+#  Call Capacity: pronóstico vs capacidad de atención por día e intervalo
+#  Compara parrilla REAL (asignaciones) vs PLAN ÓPTIMO (optimizador)
+# ============================================================
+def _capacidad_intervalo(agentes, aht, paciencia, carga=None, nda_obj=0.96):
+    """Máximas llamadas/hora que 'agentes' pueden atender cumpliendo el NDA objetivo,
+    usando el modelo de abandono del motor (nivel_atencion). La 'carga' interna del motor
+    va en Erlangs (llamadas*AHT/3600); buscamos el volumen de llamadas máximo soportable."""
+    if agentes <= 0:
+        return 0
+    paso = max(1, agentes)
+    V = 0; mejor = 0
+    tope = int(agentes * 3600 / aht * 2)
+    while V < tope:
+        V += paso
+        carga_erlangs = V * aht / 3600.0
+        if motor.nivel_atencion(agentes, carga_erlangs, aht, paciencia) >= nda_obj:
+            mejor = V
+        else:
+            break
+    return mejor
+
+
+def _agentes_por_hora_parrilla(engine, campana_id, mes):
+    """Cuenta agentes con turno 'trabajo' por (fecha, hora) desde asignaciones."""
+    df = pd.read_sql(text("""
+        SELECT fecha, hora_inicio, hora_fin
+        FROM asignaciones
+        WHERE campana_id=:c AND tipo='trabajo'
+          AND hora_inicio IS NOT NULL AND hora_fin IS NOT NULL
+          AND to_char(fecha,'YYYY-MM')=:m
+    """), engine, params={"c": campana_id, "m": mes})
+    # cuenta por (fecha, hora) expandiendo cada turno a sus horas
+    from collections import defaultdict
+    cont = defaultdict(int)
+    for _, r in df.iterrows():
+        try:
+            hi = int(str(r["hora_inicio"])[:2]); hf = int(str(r["hora_fin"])[:2])
+        except Exception:
+            continue
+        horas = []
+        h = hi
+        # recorre del inicio al fin, manejando cruce de medianoche
+        for _ in range(24):
+            if h == hf:
+                break
+            horas.append(h)
+            h = (h + 1) % 24
+        for hh in horas:
+            cont[(pd.Timestamp(r["fecha"]).date(), hh)] += 1
+    return cont
+
+
+@app.post("/call-capacity")
+async def call_capacity(
+    x_api_key: str = Header(None),
+    mes: str = Form(...),
+    campana: str = Form("Endesa"),
+    aht: int = Form(420),
+    paciencia: int = Form(90),
+    largo: int = Form(9),
+    sla: float = Form(0.80),
+    asa: int = Form(20),
+    occ: float = Form(0.65),
+    utl: float = Form(0.88),
+    esp_max: int = Form(12),
+    nda_obj: float = Form(0.96),
+    estructura: str = Form("mixto"),
+    ajuste_pct: float = Form(0.0),
+):
+    """Pronóstico de llamadas vs capacidad de atención por día e intervalo.
+    Capacidad calculada con dos plantillas: la parrilla REAL (asignaciones del mes) y el PLAN ÓPTIMO."""
+    check_key(x_api_key)
+    engine = get_engine()
+    cid = _id_campana(engine, campana)
+    if cid is None:
+        raise HTTPException(400, f"La campaña '{campana}' no existe.")
+
+    # 1) Pronóstico por fecha+intervalo (motor, con % de ajuste)
+    file_bytes = _historico_a_csv_bytes(engine, cid)
+    ajuste = (ajuste_pct or 0.0) / 100.0
+    pron = motor.largo_desde_historico(file_bytes, mes, "Nacional España", 4, 6, ajuste, mixto=False)
+    pron["fecha"] = pd.to_datetime(pron["fecha"]).dt.date
+
+    # 2) Plan óptimo -> agentes por (dow, hora)
+    S = motor.dimension_roster(pron.rename(columns={}), aht, sla, asa, occ, utl, esp_max, largo,
+                               nda_obj, paciencia, estructura)
+    turnos = motor.turnos_dict(S, largo)
+    plan_por_dow_hora = {(d, h): motor.cubierto(S, turnos, d, h) for d in range(7) for h in range(24)}
+
+    # 3) Parrilla real -> agentes por (fecha, hora)
+    real_cont = _agentes_por_hora_parrilla(engine, cid, mes)
+
+    # 4) Armar tabla por día e intervalo
+    filas = []
+    cap_cache_real = {}; cap_cache_plan = {}
+    for _, r in pron.iterrows():
+        f = r["fecha"]; h = int(r["intervalo"]); vol = float(r["volumen"])
+        dow = pd.Timestamp(f).dayofweek
+        ag_real = real_cont.get((f, h), 0)
+        ag_plan = plan_por_dow_hora.get((dow, h), 0)
+        if ag_real not in cap_cache_real:
+            cap_cache_real[ag_real] = _capacidad_intervalo(ag_real, aht, paciencia, nda_obj=nda_obj)
+        if ag_plan not in cap_cache_plan:
+            cap_cache_plan[ag_plan] = _capacidad_intervalo(ag_plan, aht, paciencia, nda_obj=nda_obj)
+        cap_real = cap_cache_real[ag_real]
+        cap_plan = cap_cache_plan[ag_plan]
+        filas.append({
+            "fecha": str(f), "intervalo": h, "pronosticadas": round(vol),
+            "agentes_real": ag_real, "capacidad_real": cap_real,
+            "deficit_real": round(vol) - cap_real,
+            "agentes_plan": ag_plan, "capacidad_plan": cap_plan,
+            "deficit_plan": round(vol) - cap_plan,
+        })
+
+    df = pd.DataFrame(filas)
+    # resumen por día
+    por_dia = []
+    for f, g in df.groupby("fecha"):
+        por_dia.append({
+            "fecha": f,
+            "pronosticadas": int(g["pronosticadas"].sum()),
+            "capacidad_real": int(g["capacidad_real"].sum()),
+            "capacidad_plan": int(g["capacidad_plan"].sum()),
+            "deficit_real": int(g["pronosticadas"].sum() - g["capacidad_real"].sum()),
+            "deficit_plan": int(g["pronosticadas"].sum() - g["capacidad_plan"].sum()),
+        })
+
+    return {"ok": True, "campana": campana, "mes": mes,
+            "por_intervalo": filas, "por_dia": por_dia,
+            "totales": {
+                "pronosticadas": int(df["pronosticadas"].sum()),
+                "capacidad_real": int(df["capacidad_real"].sum()),
+                "capacidad_plan": int(df["capacidad_plan"].sum()),
+            }}
+
+
+# ============================================================
+#  Exportar Planeación a Excel (varias pestañas)
+# ============================================================
+@app.post("/planeacion/export")
+async def planeacion_export(
+    x_api_key: str = Header(None),
+    mes: str = Form(...),
+    campana: str = Form("Endesa"),
+    aht: int = Form(420),
+    sla: float = Form(0.80),
+    asa: int = Form(20),
+    occ: float = Form(0.65),
+    utl: float = Form(0.88),
+    esp_max: int = Form(12),
+    largo: int = Form(9),
+    nda_obj: float = Form(0.96),
+    paciencia: int = Form(90),
+    estructura: str = Form("mixto"),
+    absentismo: float = Form(0.15),
+    ajuste_pct: float = Form(0.0),
+    incluir_capacity: bool = Form(True),
+):
+    """Genera un Excel con: Resumen, Plan de turnos, Requerido vs Programado por hora,
+    y (opcional) Call Capacity por día e intervalo. Aplica el % de ajuste de volumen."""
+    check_key(x_api_key)
+    engine = get_engine()
+    cid = _id_campana(engine, campana)
+    if cid is None:
+        raise HTTPException(400, f"La campaña '{campana}' no existe.")
+
+    file_bytes = _historico_a_csv_bytes(engine, cid)
+    ajuste = (ajuste_pct or 0.0) / 100.0
+    largo_df = motor.largo_desde_historico(file_bytes, mes, "Nacional España", 4, 6, ajuste, mixto=False)
+    S = motor.dimension_roster(largo_df, aht, sla, asa, occ, utl, esp_max, largo,
+                               nda_obj, paciencia, estructura)
+    turnos = motor.turnos_dict(S, largo)
+    NOM = ["Lunes", "Martes", "Miércoles", "Jueves", "Viernes", "Sábado", "Domingo"]
+
+    import math as _m
+    presentes = S["te"] + S["tc"]
+    en_nomina = _m.ceil(presentes / (1 - absentismo)) if absentismo < 1 else presentes
+
+    # 1) Resumen
+    df_resumen = pd.DataFrame([
+        {"Concepto": "Campaña", "Valor": campana},
+        {"Concepto": "Mes", "Valor": mes},
+        {"Concepto": "Ajuste de volumen aplicado", "Valor": f"{ajuste_pct:+.0f}%"},
+        {"Concepto": "Volumen total proyectado", "Valor": int(S["total"])},
+        {"Concepto": "Estructura", "Valor": estructura},
+        {"Concepto": "Agentes España (L-V)", "Valor": int(S["te"])},
+        {"Concepto": "Agentes Colombia (24/7)", "Valor": int(S["tc"])},
+        {"Concepto": "Total presentes", "Valor": int(presentes)},
+        {"Concepto": "En nómina (con absentismo)", "Valor": int(en_nomina)},
+        {"Concepto": "AHT (s)", "Valor": aht}, {"Concepto": "SLA", "Valor": sla},
+        {"Concepto": "ASA (s)", "Valor": asa}, {"Concepto": "OCC", "Valor": occ},
+        {"Concepto": "UTL", "Valor": utl}, {"Concepto": "NDA objetivo", "Valor": nda_obj},
+        {"Concepto": "Paciencia (s)", "Valor": paciencia},
+        {"Concepto": "Largo turno (h)", "Valor": largo},
+        {"Concepto": "Absentismo", "Valor": absentismo},
+    ])
+
+    # 2) Plan de turnos
+    plan = []
+    for k in sorted(S["xe"], key=int):
+        t = int(k)
+        plan.append({"País": "España", "Inicio": f"{t:02d}:00",
+                     "Fin": f"{(t+largo)%24:02d}:00", "Cantidad": S["xe"][k], "Libres": "Sáb, Dom"})
+    for k in sorted(S["xc"], key=lambda x: (int(x.split("_")[0]), int(x.split("_")[1]))):
+        t, p = map(int, k.split("_"))
+        o = sorted(motor.LIBRES_VIZ[p])
+        plan.append({"País": "Colombia", "Inicio": f"{t:02d}:00",
+                     "Fin": f"{(t+largo)%24:02d}:00", "Cantidad": S["xc"][k],
+                     "Libres": f"{NOM[o[0]][:3]}, {NOM[o[1]][:3]}"})
+    df_plan = pd.DataFrame(plan) if plan else pd.DataFrame([{"País": "-", "Inicio": "-", "Fin": "-", "Cantidad": 0, "Libres": "-"}])
+
+    # 3) Requerido vs Programado por día y hora
+    rows_rp = []
+    for d in range(7):
+        for h in range(24):
+            req = S["peak"][d][h]
+            cob = motor.cubierto(S, turnos, d, h)
+            rows_rp.append({"Día": NOM[d], "Hora": f"{h:02d}:00", "Requerido": req,
+                            "Programado": cob, "Diferencia": cob - req,
+                            "Ocupación %": round(S["occ"][d][h]*100, 1),
+                            "NDA %": round(S["nda"][d][h]*100, 1)})
+    df_rp = pd.DataFrame(rows_rp)
+
+    # Construir Excel
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as xw:
+        df_resumen.to_excel(xw, sheet_name="Resumen", index=False)
+        df_plan.to_excel(xw, sheet_name="Plan de turnos", index=False)
+        df_rp.to_excel(xw, sheet_name="Requerido vs Programado", index=False)
+
+        # 4) Call capacity (opcional, puede ser pesado)
+        if incluir_capacity:
+            plan_por_dow_hora = {(d, h): motor.cubierto(S, turnos, d, h) for d in range(7) for h in range(24)}
+            real_cont = _agentes_por_hora_parrilla(engine, cid, mes)
+            largo_df["fecha"] = pd.to_datetime(largo_df["fecha"]).dt.date
+            cap_real = {}; cap_plan = {}
+            rows_cap = []
+            for _, r in largo_df.iterrows():
+                f = r["fecha"]; h = int(r["intervalo"]); vol = float(r["volumen"])
+                dow = pd.Timestamp(f).dayofweek
+                ar = real_cont.get((f, h), 0); ap = plan_por_dow_hora.get((dow, h), 0)
+                if ar not in cap_real: cap_real[ar] = _capacidad_intervalo(ar, aht, paciencia, nda_obj=nda_obj)
+                if ap not in cap_plan: cap_plan[ap] = _capacidad_intervalo(ap, aht, paciencia, nda_obj=nda_obj)
+                rows_cap.append({"Fecha": str(f), "Hora": f"{h:02d}:00", "Pronosticadas": round(vol),
+                                 "Agentes parrilla": ar, "Capacidad parrilla": cap_real[ar],
+                                 "Déficit parrilla": round(vol) - cap_real[ar],
+                                 "Agentes plan": ap, "Capacidad plan": cap_plan[ap],
+                                 "Déficit plan": round(vol) - cap_plan[ap]})
+            df_cap = pd.DataFrame(rows_cap)
+            df_cap.to_excel(xw, sheet_name="Call Capacity intervalo", index=False)
+            # resumen diario
+            if not df_cap.empty:
+                gd = df_cap.groupby("Fecha").agg(
+                    Pronosticadas=("Pronosticadas", "sum"),
+                    Capacidad_parrilla=("Capacidad parrilla", "sum"),
+                    Capacidad_plan=("Capacidad plan", "sum")).reset_index()
+                gd["Déficit parrilla"] = gd["Pronosticadas"] - gd["Capacidad_parrilla"]
+                gd["Déficit plan"] = gd["Pronosticadas"] - gd["Capacidad_plan"]
+                gd.to_excel(xw, sheet_name="Call Capacity día", index=False)
+    buf.seek(0)
+
+    from fastapi.responses import StreamingResponse
+    nombre = f"planeacion_{campana}_{mes}.xlsx"
+    return StreamingResponse(
+        buf,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f'attachment; filename="{nombre}"'},
+    )
