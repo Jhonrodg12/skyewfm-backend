@@ -2227,6 +2227,22 @@ async def agentes_importar(
                     where es_plantilla = true and campana_id = 1
                 """), {"c": id_camp})
 
+            # Sembrar metas de adherencia por defecto para la campaña nueva
+            metas_def = [
+                ("adh_neta", "alto", 99, 99, 95, "%"),
+                ("adh_bruta", "alto", 95, 95, 90, "%"),
+                ("productividad", "alto", 96, 96, 90, "%"),
+                ("utilizacion", "alto", 88, 88, 80, "%"),
+                ("ocupacion", "alto", 85, 85, 75, "%"),
+                ("tmo", "bajo", 300, 300, 360, "seg"),
+            ]
+            for ind, dirn, meta, verde, amar, uni in metas_def:
+                conn.execute(text("""
+                    insert into campana_metas (campana_id, indicador, direccion, meta, verde, amarillo, unidad)
+                    values (:c, :i, :d, :m, :v, :a, :u)
+                    on conflict (campana_id, indicador) do nothing
+                """), {"c": id_camp, "i": ind, "d": dirn, "m": meta, "v": verde, "a": amar, "u": uni})
+
         existentes = {str(x[0]).strip().upper(): int(x[1]) for x in
                       conn.execute(text("select dni, id from agentes where dni is not null")).fetchall()}
         nuevos = [f for f in filas if f["dni"] not in existentes]
