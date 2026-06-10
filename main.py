@@ -2211,7 +2211,7 @@ async def agentes_importar(
                     insert into crm_tipificaciones (nombre, activo, orden, campana_id, es_plantilla)
                     select nombre, activo, orden, :c, false
                     from crm_tipificaciones
-                    where es_plantilla = true
+                    where es_plantilla = true and campana_id = 1
                 """), {"c": id_camp})
 
         existentes = {str(x[0]).strip().upper(): int(x[1]) for x in
@@ -2785,8 +2785,7 @@ async def tipificaciones_clonar_plantilla(
             insert into crm_tipificaciones (nombre, activo, orden, campana_id, es_plantilla)
             select nombre, activo, orden, :c, false
             from crm_tipificaciones
-            where es_plantilla = true
-            returning id
+            where es_plantilla = true and campana_id = 1
         """), {"c": cid})
-        n = len(res.fetchall())
+        n = res.rowcount or 0
     return {"ok": True, "campana": campana, "clonadas": n}
