@@ -2655,21 +2655,46 @@ async def planeacion_export(
                     L = get_column_letter(col)
                     ws.cell(row=tot_row, column=col, value=f"=SUM({L}2:{L}{len(dfm)+1})")
 
-        # ---- 7 gráficas Req vs Prog (una por día) en la hoja ----
+        # ---- 7 gráficas Req vs Prog (una por día) estilo herramienta web ----
+        # Requerido = barras grises | Programado = línea escalonada verde con marcadores
+        from openpyxl.chart.marker import Marker
+        from openpyxl.drawing.line import LineProperties
+        from openpyxl.chart.shapes import GraphicalProperties
+        from openpyxl.drawing.fill import PatternFillProperties, ColorChoice
         ws_rp = xw.sheets["Req vs Prog"]
-        # columnas: A=Hora, luego pares (Req, Prog) por día => día d ocupa col 2+2d (Req) y 3+2d (Prog)
         anchor_row = 2
         for d in range(7):
             col_req = 2 + 2*d
             col_prog = 3 + 2*d
-            ch = LineChart(); ch.title = f"{NOM[d]} — Req vs Prog"; ch.height = 7.5; ch.width = 15
-            data = Reference(ws_rp, min_col=col_req, max_col=col_prog, min_row=1, max_row=25)
+            # Barras (Requerido)
+            bar = BarChart(); bar.type = "col"; bar.title = f"{NOM[d]} — Req vs Prog"
+            bar.height = 7.5; bar.width = 15
+            data_req = Reference(ws_rp, min_col=col_req, max_col=col_req, min_row=1, max_row=25)
             cats = Reference(ws_rp, min_col=1, min_row=2, max_row=25)
-            ch.add_data(data, titles_from_data=True); ch.set_categories(cats)
-            # ubicar 2 por fila a la derecha de los datos
+            bar.add_data(data_req, titles_from_data=True); bar.set_categories(cats)
+            # color gris para las barras
+            try:
+                bar.series[0].graphicalProperties.solidFill = "BFBFBF"
+            except Exception:
+                pass
+            # Línea (Programado) escalonada verde con marcadores
+            line = LineChart()
+            data_prog = Reference(ws_rp, min_col=col_prog, max_col=col_prog, min_row=1, max_row=25)
+            line.add_data(data_prog, titles_from_data=True)
+            s = line.series[0]
+            s.smooth = False          # sin suavizado
+            try:
+                s.graphicalProperties = GraphicalProperties()
+                s.graphicalProperties.line = LineProperties(solidFill="2E7D32", w=20000)  # verde
+                s.marker = Marker(symbol="circle", size=5)
+                s.marker.graphicalProperties = GraphicalProperties(solidFill="2E7D32")
+            except Exception:
+                pass
+            bar.y_axis.title = None; bar.x_axis.delete = False
+            bar += line  # combinar barras + línea en el mismo gráfico
             anchor_col_letter = get_column_letter(df_rp.shape[1] + 2 + (d % 2) * 9)
             anchor = f"{anchor_col_letter}{anchor_row + (d // 2) * 16}"
-            ws_rp.add_chart(ch, anchor)
+            ws_rp.add_chart(bar, anchor)
 
         # ---- Gráfica volumen total por día (Previsión) ----
         ws_pv = xw.sheets["Previsión"]
