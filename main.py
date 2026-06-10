@@ -2491,7 +2491,7 @@ async def call_capacity(
 
 
 # ============================================================
-#  Exportar Planeación a Excel (varias pestañas)
+#  Exportar Planeación a Excel (matriz fecha×hora + gráficas)
 # ============================================================
 @app.post("/planeacion/export")
 async def planeacion_export(
@@ -2512,27 +2512,31 @@ async def planeacion_export(
     ajuste_pct: float = Form(0.0),
     incluir_capacity: bool = Form(True),
 ):
-    """Genera un Excel con: Resumen, Plan de turnos, Requerido vs Programado por hora,
-    y (opcional) Call Capacity por día e intervalo. Aplica el % de ajuste de volumen."""
+    """Excel con: Resumen, Plan de turnos, Previsión (matriz fecha×hora), Requerido vs Programado,
+    y Call Capacity (matrices fecha×hora) — con gráficas nativas. Aplica el % de ajuste de volumen."""
     check_key(x_api_key)
     engine = get_engine()
     cid = _id_campana(engine, campana)
     if cid is None:
         raise HTTPException(400, f"La campaña '{campana}' no existe.")
 
+    from openpyxl.chart import BarChart, LineChart, Reference
+
     file_bytes = _historico_a_csv_bytes(engine, cid)
     ajuste = (ajuste_pct or 0.0) / 100.0
     largo_df = motor.largo_desde_historico(file_bytes, mes, "Nacional España", 4, 6, ajuste, mixto=False)
+    largo_df["fecha"] = pd.to_datetime(largo_df["fecha"]).dt.date
     S = motor.dimension_roster(largo_df, aht, sla, asa, occ, utl, esp_max, largo,
                                nda_obj, paciencia, estructura)
     turnos = motor.turnos_dict(S, largo)
     NOM = ["Lunes", "Martes", "Miércoles", "Jueves", "Viernes", "Sábado", "Domingo"]
+    HORAS = [f"{h:02d}h" for h in range(24)]
 
     import math as _m
     presentes = S["te"] + S["tc"]
     en_nomina = _m.ceil(presentes / (1 - absentismo)) if absentismo < 1 else presentes
 
-    # 1) Resumen
+    # ---- Resumen ----
     df_resumen = pd.DataFrame([
         {"Concepto": "Campaña", "Valor": campana},
         {"Concepto": "Mes", "Valor": mes},
@@ -2551,7 +2555,7 @@ async def planeacion_export(
         {"Concepto": "Absentismo", "Valor": absentismo},
     ])
 
-    # 2) Plan de turnos
+    # ---- Plan de turnos ----
     plan = []
     for k in sorted(S["xe"], key=int):
         t = int(k)
@@ -2565,54 +2569,147 @@ async def planeacion_export(
                      "Libres": f"{NOM[o[0]][:3]}, {NOM[o[1]][:3]}"})
     df_plan = pd.DataFrame(plan) if plan else pd.DataFrame([{"País": "-", "Inicio": "-", "Fin": "-", "Cantidad": 0, "Libres": "-"}])
 
-    # 3) Requerido vs Programado por día y hora
+    # ---- Previsión MATRIZ: filas=fecha, columnas=horas ----
+    piv = largo_df.pivot_table(index="fecha", columns="intervalo", values="volumen", aggfunc="sum").fillna(0)
+    piv = piv.reindex(columns=range(24), fill_value=0)
+    df_prev = piv.copy()
+    df_prev.columns = HORAS
+    df_prev.insert(0, "Día", [NOM[pd.Timestamp(f).dayofweek] for f in df_prev.index])
+    df_prev.index.name = "Fecha"
+    df_prev = df_prev.reset_index()
+
+    # ---- Requerido vs Programado (por hora, promedio semana tipo) ----
     rows_rp = []
-    for d in range(7):
-        for h in range(24):
-            req = S["peak"][d][h]
-            cob = motor.cubierto(S, turnos, d, h)
-            rows_rp.append({"Día": NOM[d], "Hora": f"{h:02d}:00", "Requerido": req,
-                            "Programado": cob, "Diferencia": cob - req,
-                            "Ocupación %": round(S["occ"][d][h]*100, 1),
-                            "NDA %": round(S["nda"][d][h]*100, 1)})
+    for h in range(24):
+        req = max(S["peak"][d][h] for d in range(7))
+        cob = max(motor.cubierto(S, turnos, d, h) for d in range(7))
+        rows_rp.append({"Hora": HORAS[h], "Requerido (pico)": req, "Programado (pico)": cob})
     df_rp = pd.DataFrame(rows_rp)
 
-    # Construir Excel
+    # ---- Ocupación por hora (matriz día×hora, en %) y promedio por hora ----
+    rows_occ = []
+    for d in range(7):
+        fila = {"Día": NOM[d]}
+        for h in range(24):
+            fila[HORAS[h]] = round(S["occ"][d][h] * 100, 1)
+        rows_occ.append(fila)
+    df_occ = pd.DataFrame(rows_occ)
+    df_occ_prom = pd.DataFrame([
+        {"Hora": HORAS[h],
+         "Ocupación % (prom)": round(sum(S["occ"][d][h] for d in range(7)) / 7 * 100, 1),
+         "Objetivo %": round(occ * 100, 1)}
+        for h in range(24)
+    ])
+
+    # ---- NDA por hora (matriz día×hora, en %) y promedio por hora ----
+    rows_nda = []
+    for d in range(7):
+        fila = {"Día": NOM[d]}
+        for h in range(24):
+            fila[HORAS[h]] = round(S["nda"][d][h] * 100, 1)
+        rows_nda.append(fila)
+    df_nda = pd.DataFrame(rows_nda)
+    df_nda_prom = pd.DataFrame([
+        {"Hora": HORAS[h],
+         "NDA % (prom)": round(sum(S["nda"][d][h] for d in range(7)) / 7 * 100, 1),
+         "Objetivo %": round(nda_obj * 100, 1)}
+        for h in range(24)
+    ])
+
+    # ---- Capacity matrices (déficit fecha×hora) ----
+    df_cap_real = df_cap_plan = None
+    if incluir_capacity:
+        plan_por_dow_hora = {(d, h): motor.cubierto(S, turnos, d, h) for d in range(7) for h in range(24)}
+        real_cont = _agentes_por_hora_parrilla(engine, cid, mes)
+        cap_real_cache = {}; cap_plan_cache = {}
+        def cap_real_for(ag):
+            if ag not in cap_real_cache: cap_real_cache[ag] = _capacidad_intervalo(ag, aht, paciencia, nda_obj=nda_obj)
+            return cap_real_cache[ag]
+        def cap_plan_for(ag):
+            if ag not in cap_plan_cache: cap_plan_cache[ag] = _capacidad_intervalo(ag, aht, paciencia, nda_obj=nda_obj)
+            return cap_plan_cache[ag]
+        fechas = sorted(largo_df["fecha"].unique())
+        m_real = {}; m_plan = {}
+        volp = largo_df.set_index(["fecha", "intervalo"])["volumen"].to_dict()
+        for f in fechas:
+            dow = pd.Timestamp(f).dayofweek
+            m_real[f] = []; m_plan[f] = []
+            for h in range(24):
+                vol = float(volp.get((f, h), 0))
+                ar = real_cont.get((f, h), 0); ap = plan_por_dow_hora.get((dow, h), 0)
+                m_real[f].append(round(vol) - cap_real_for(ar))   # déficit (+falta / -sobra)
+                m_plan[f].append(round(vol) - cap_plan_for(ap))
+        df_cap_real = pd.DataFrame.from_dict(m_real, orient="index", columns=HORAS)
+        df_cap_real.insert(0, "Día", [NOM[pd.Timestamp(f).dayofweek] for f in df_cap_real.index])
+        df_cap_real.index.name = "Fecha"; df_cap_real = df_cap_real.reset_index()
+        df_cap_plan = pd.DataFrame.from_dict(m_plan, orient="index", columns=HORAS)
+        df_cap_plan.insert(0, "Día", [NOM[pd.Timestamp(f).dayofweek] for f in df_cap_plan.index])
+        df_cap_plan.index.name = "Fecha"; df_cap_plan = df_cap_plan.reset_index()
+
+    # ---- Escribir Excel ----
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl") as xw:
         df_resumen.to_excel(xw, sheet_name="Resumen", index=False)
         df_plan.to_excel(xw, sheet_name="Plan de turnos", index=False)
-        df_rp.to_excel(xw, sheet_name="Requerido vs Programado", index=False)
+        df_prev.to_excel(xw, sheet_name="Previsión", index=False)
+        df_rp.to_excel(xw, sheet_name="Req vs Prog", index=False)
+        # Ocupación: matriz día×hora + promedio por hora (con gráfica)
+        df_occ.to_excel(xw, sheet_name="Ocupación", index=False)
+        df_occ_prom.to_excel(xw, sheet_name="Ocupación", index=False, startrow=len(df_occ)+3)
+        # NDA: matriz día×hora + promedio por hora (con gráfica)
+        df_nda.to_excel(xw, sheet_name="NDA", index=False)
+        df_nda_prom.to_excel(xw, sheet_name="NDA", index=False, startrow=len(df_nda)+3)
+        if df_cap_real is not None:
+            df_cap_real.to_excel(xw, sheet_name="Capacity parrilla", index=False)
+            df_cap_plan.to_excel(xw, sheet_name="Capacity plan", index=False)
 
-        # 4) Call capacity (opcional, puede ser pesado)
-        if incluir_capacity:
-            plan_por_dow_hora = {(d, h): motor.cubierto(S, turnos, d, h) for d in range(7) for h in range(24)}
-            real_cont = _agentes_por_hora_parrilla(engine, cid, mes)
-            largo_df["fecha"] = pd.to_datetime(largo_df["fecha"]).dt.date
-            cap_real = {}; cap_plan = {}
-            rows_cap = []
-            for _, r in largo_df.iterrows():
-                f = r["fecha"]; h = int(r["intervalo"]); vol = float(r["volumen"])
-                dow = pd.Timestamp(f).dayofweek
-                ar = real_cont.get((f, h), 0); ap = plan_por_dow_hora.get((dow, h), 0)
-                if ar not in cap_real: cap_real[ar] = _capacidad_intervalo(ar, aht, paciencia, nda_obj=nda_obj)
-                if ap not in cap_plan: cap_plan[ap] = _capacidad_intervalo(ap, aht, paciencia, nda_obj=nda_obj)
-                rows_cap.append({"Fecha": str(f), "Hora": f"{h:02d}:00", "Pronosticadas": round(vol),
-                                 "Agentes parrilla": ar, "Capacidad parrilla": cap_real[ar],
-                                 "Déficit parrilla": round(vol) - cap_real[ar],
-                                 "Agentes plan": ap, "Capacidad plan": cap_plan[ap],
-                                 "Déficit plan": round(vol) - cap_plan[ap]})
-            df_cap = pd.DataFrame(rows_cap)
-            df_cap.to_excel(xw, sheet_name="Call Capacity intervalo", index=False)
-            # resumen diario
-            if not df_cap.empty:
-                gd = df_cap.groupby("Fecha").agg(
-                    Pronosticadas=("Pronosticadas", "sum"),
-                    Capacidad_parrilla=("Capacidad parrilla", "sum"),
-                    Capacidad_plan=("Capacidad plan", "sum")).reset_index()
-                gd["Déficit parrilla"] = gd["Pronosticadas"] - gd["Capacidad_parrilla"]
-                gd["Déficit plan"] = gd["Pronosticadas"] - gd["Capacidad_plan"]
-                gd.to_excel(xw, sheet_name="Call Capacity día", index=False)
+        wb = xw.book
+        # Gráfica Req vs Prog (líneas) en la hoja Req vs Prog
+        ws_rp = xw.sheets["Req vs Prog"]
+        ch = LineChart(); ch.title = "Requerido vs Programado (pico por hora)"
+        ch.height = 9; ch.width = 20
+        data = Reference(ws_rp, min_col=2, max_col=3, min_row=1, max_row=25)
+        cats = Reference(ws_rp, min_col=1, min_row=2, max_row=25)
+        ch.add_data(data, titles_from_data=True); ch.set_categories(cats)
+        ws_rp.add_chart(ch, "F2")
+
+        # Gráfica Ocupación por hora (barras: ocupación vs objetivo)
+        ws_oc = xw.sheets["Ocupación"]
+        r0 = len(df_occ) + 4  # fila donde empieza la tabla promedio (1-indexed header)
+        cho = BarChart(); cho.title = "Ocupación por hora (% prom) vs objetivo"
+        cho.height = 9; cho.width = 20
+        do = Reference(ws_oc, min_col=2, max_col=3, min_row=r0, max_row=r0+24)
+        co = Reference(ws_oc, min_col=1, min_row=r0+1, max_row=r0+24)
+        cho.add_data(do, titles_from_data=True); cho.set_categories(co)
+        ws_oc.add_chart(cho, f"A{r0+27}")
+
+        # Gráfica NDA por hora (barras: NDA vs objetivo)
+        ws_nd = xw.sheets["NDA"]
+        rn = len(df_nda) + 4
+        chn = BarChart(); chn.title = "NDA por hora (% prom) vs objetivo"
+        chn.height = 9; chn.width = 20
+        dn = Reference(ws_nd, min_col=2, max_col=3, min_row=rn, max_row=rn+24)
+        cn = Reference(ws_nd, min_col=1, min_row=rn+1, max_row=rn+24)
+        chn.add_data(dn, titles_from_data=True); chn.set_categories(cn)
+        ws_nd.add_chart(chn, f"A{rn+27}")
+
+        # Gráfica de volumen total por día (barras) basada en Previsión
+        ws_pv = xw.sheets["Previsión"]
+        # columna auxiliar con total por día al final
+        ncol = df_prev.shape[1]  # incluye Fecha + Día + 24h
+        last_col = ncol + 1
+        ws_pv.cell(row=1, column=last_col, value="Total día")
+        for i in range(len(df_prev)):
+            # suma de las 24 columnas de horas (desde col 3 hasta col 26)
+            fila = i + 2
+            ws_pv.cell(row=fila, column=last_col,
+                       value=f"=SUM(C{fila}:Z{fila})")
+        chb = BarChart(); chb.title = "Volumen total por día"
+        chb.height = 9; chb.width = 24
+        dref = Reference(ws_pv, min_col=last_col, min_row=1, max_row=len(df_prev)+1)
+        cref = Reference(ws_pv, min_col=1, min_row=2, max_row=len(df_prev)+1)
+        chb.add_data(dref, titles_from_data=True); chb.set_categories(cref)
+        ws_pv.add_chart(chb, f"A{len(df_prev)+4}")
     buf.seek(0)
 
     from fastapi.responses import StreamingResponse
