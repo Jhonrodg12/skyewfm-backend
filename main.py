@@ -2132,7 +2132,7 @@ async def agentes_importar(
                 vals.append(f"(:dni{j}, :nombre{j}, :centro{j}, :pais{j}, :modo{j}, :turno{j}, "
                             f":login_acd{j}, cast(:fecha_alta{j} as date), cast(:jornada_horas{j} as numeric), "
                             f"cast(:salario_mensual{j} as numeric), cast(:vacaciones_anuales{j} as numeric), "
-                            f":camp{j}, 'activo')")
+                            f":camp{j}, 'ACTIVO')")
                 for c in cols: params[f"{c}{j}"] = f[c]
                 params[f"camp{j}"] = id_camp
             conn.execute(text(
