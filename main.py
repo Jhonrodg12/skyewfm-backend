@@ -92,14 +92,19 @@ def capacidad_anual(
     nda_obj: float = 0.96, paciencia: int = 90,
     estructura: str = "mixto", absentismo: float = 0.15,
     plantilla_actual: int = 129,
+    campana: str = None,
 ):
     """Dimensiona los 12 meses del año: agentes necesarios por mes."""
     check_key(x_api_key)
     import math as _m
     engine = get_engine()
-    file_bytes = _historico_a_csv_bytes(engine)
+    cid = _id_campana(engine, campana)
+    file_bytes = _historico_a_csv_bytes(engine, cid)
     # fechas con datos reales (para marcar estado)
-    dch = pd.read_sql(text("SELECT DISTINCT fecha FROM historico_llamadas"), engine)
+    if cid is not None:
+        dch = pd.read_sql(text("SELECT DISTINCT fecha FROM historico_llamadas WHERE campana_id=:c"), engine, params={"c": cid})
+    else:
+        dch = pd.read_sql(text("SELECT DISTINCT fecha FROM historico_llamadas"), engine)
     dias_datos = set(pd.to_datetime(dch["fecha"]).dt.normalize())
 
     MESES = ["Ene","Feb","Mar","Abr","May","Jun","Jul","Ago","Sep","Oct","Nov","Dic"]
@@ -143,12 +148,17 @@ def proyeccion_anual(
     scope: str = "Nacional España",
     colas: str = None,
     ajuste_meses: str = None,   # 12 valores % separados por coma, ej "0,0,10,0,..."
+    campana: str = None,
 ):
     """Proyección anual de volumen: Base (sin ajustes) vs Escenario (con ajustes)."""
     check_key(x_api_key)
     import holidays as _hol
     engine = get_engine()
-    d = pd.read_sql(text("SELECT fecha, cola, entrantes FROM historico_llamadas"), engine)
+    cid = _id_campana(engine, campana)
+    if cid is not None:
+        d = pd.read_sql(text("SELECT fecha, cola, entrantes FROM historico_llamadas WHERE campana_id=:c"), engine, params={"c": cid})
+    else:
+        d = pd.read_sql(text("SELECT fecha, cola, entrantes FROM historico_llamadas"), engine)
     if d.empty:
         return {"ok": True, "vacio": True}
     d["fecha"] = pd.to_datetime(d["fecha"]).dt.normalize()
@@ -245,11 +255,18 @@ def dashboard_historico(
     semana: int = None,
     colas: str = None,   # colas separadas por coma; vacío = todas
     dows: str = None,    # días de semana 0-6 separados por coma; vacío = todos
+    campana: str = None, # nombre de campaña; vacío = todas
 ):
     """Devuelve datos agregados del histórico para el dashboard, según filtros."""
     check_key(x_api_key)
     engine = get_engine()
-    df = pd.read_sql(text("SELECT fecha, hora, cola, entrantes, atendidas, abandonadas FROM historico_llamadas"), engine)
+    cid = _id_campana(engine, campana)
+    if cid is not None:
+        df = pd.read_sql(text("SELECT fecha, hora, cola, entrantes, atendidas, abandonadas "
+                              "FROM historico_llamadas WHERE campana_id=:c"),
+                         engine, params={"c": cid})
+    else:
+        df = pd.read_sql(text("SELECT fecha, hora, cola, entrantes, atendidas, abandonadas FROM historico_llamadas"), engine)
     if df.empty:
         return {"ok": True, "vacio": True}
     df["fecha"] = pd.to_datetime(df["fecha"])
@@ -308,11 +325,16 @@ def dashboard_historico(
 
 
 @app.get("/dashboard-opciones")
-def dashboard_opciones(x_api_key: str = Header(None)):
+def dashboard_opciones(x_api_key: str = Header(None), campana: str = None):
     """Devuelve los valores disponibles para los filtros (años, colas)."""
     check_key(x_api_key)
     engine = get_engine()
-    df = pd.read_sql(text("SELECT DISTINCT fecha, cola FROM historico_llamadas"), engine)
+    cid = _id_campana(engine, campana)
+    if cid is not None:
+        df = pd.read_sql(text("SELECT DISTINCT fecha, cola FROM historico_llamadas WHERE campana_id=:c"),
+                         engine, params={"c": cid})
+    else:
+        df = pd.read_sql(text("SELECT DISTINCT fecha, cola FROM historico_llamadas"), engine)
     if df.empty:
         return {"ok": True, "anios": [], "colas": []}
     df["fecha"] = pd.to_datetime(df["fecha"])
@@ -324,16 +346,20 @@ def dashboard_opciones(x_api_key: str = Header(None)):
 @app.post("/historico/actualizar")
 async def historico_actualizar(
     x_api_key: str = Header(None),
+    campana: str = Form("Endesa"),
     archivo: UploadFile = File(...),
 ):
     """
-    Sube un CSV y lo fusiona con el histórico acumulado (upsert):
-    - Filas con fecha+hora+cola ya existentes: se SOBRESCRIBEN.
+    Sube un CSV y lo fusiona con el histórico acumulado de UNA campaña (upsert):
+    - Filas con fecha+hora+cola ya existentes en esa campaña: se SOBRESCRIBEN.
     - Filas nuevas: se AGREGAN.
     Columnas esperadas: fecha, hora, cola, entrantes, atendidas, abandonadas.
     """
     check_key(x_api_key)
     engine = get_engine()
+    cid = _id_campana(engine, campana)
+    if cid is None:
+        raise HTTPException(400, f"La campaña '{campana}' no existe.")
     file_bytes = await archivo.read()
     df = pd.read_csv(io.BytesIO(file_bytes))
     df.columns = [c.strip().lower() for c in df.columns]
@@ -352,17 +378,19 @@ async def historico_actualizar(
     with engine.begin() as conn:
         for _, r in df.iterrows():
             conn.execute(text("""
-                INSERT INTO historico_llamadas (fecha, hora, cola, entrantes, atendidas, abandonadas, actualizado_en)
-                VALUES (:f, :h, :c, :e, :a, :ab, now())
-                ON CONFLICT (fecha, hora, cola)
+                INSERT INTO historico_llamadas (fecha, hora, cola, entrantes, atendidas, abandonadas, campana_id, actualizado_en)
+                VALUES (:f, :h, :c, :e, :a, :ab, :cid, now())
+                ON CONFLICT (fecha, hora, cola, campana_id)
                 DO UPDATE SET entrantes=EXCLUDED.entrantes, atendidas=EXCLUDED.atendidas,
                               abandonadas=EXCLUDED.abandonadas, actualizado_en=now()
             """), {"f": r["fecha"], "h": int(r["hora"]), "c": str(r["cola"]),
-                   "e": int(r["entrantes"]), "a": int(r["atendidas"]), "ab": int(r["abandonadas"])})
+                   "e": int(r["entrantes"]), "a": int(r["atendidas"]), "ab": int(r["abandonadas"]),
+                   "cid": cid})
             insertadas += 1
 
-    # rango del histórico tras la actualización
-    rango = pd.read_sql(text("SELECT MIN(fecha) AS desde, MAX(fecha) AS hasta, COUNT(*) AS filas FROM historico_llamadas"), engine)
+    # rango del histórico de esa campaña tras la actualización
+    rango = pd.read_sql(text("SELECT MIN(fecha) AS desde, MAX(fecha) AS hasta, COUNT(*) AS filas "
+                             "FROM historico_llamadas WHERE campana_id=:c"), engine, params={"c": cid})
     return {
         "ok": True,
         "filas_csv": filas_csv,
@@ -374,11 +402,16 @@ async def historico_actualizar(
 
 
 @app.get("/historico/estado")
-def historico_estado(x_api_key: str = Header(None)):
-    """Devuelve hasta qué fecha hay histórico cargado."""
+def historico_estado(x_api_key: str = Header(None), campana: str = None):
+    """Devuelve hasta qué fecha hay histórico cargado (de la campaña indicada o de todas)."""
     check_key(x_api_key)
     engine = get_engine()
-    rango = pd.read_sql(text("SELECT MIN(fecha) AS desde, MAX(fecha) AS hasta, COUNT(*) AS filas FROM historico_llamadas"), engine)
+    cid = _id_campana(engine, campana)
+    if cid is not None:
+        rango = pd.read_sql(text("SELECT MIN(fecha) AS desde, MAX(fecha) AS hasta, COUNT(*) AS filas "
+                                 "FROM historico_llamadas WHERE campana_id=:c"), engine, params={"c": cid})
+    else:
+        rango = pd.read_sql(text("SELECT MIN(fecha) AS desde, MAX(fecha) AS hasta, COUNT(*) AS filas FROM historico_llamadas"), engine)
     if rango["filas"][0] == 0:
         return {"ok": True, "vacio": True}
     return {
@@ -389,9 +422,23 @@ def historico_estado(x_api_key: str = Header(None)):
     }
 
 
-def _historico_a_csv_bytes(engine):
-    """Lee todo el histórico de la base y lo devuelve como CSV en bytes (para el optimizador)."""
-    df = pd.read_sql(text("SELECT fecha, hora, cola, entrantes, atendidas, abandonadas FROM historico_llamadas ORDER BY fecha, hora"), engine)
+def _id_campana(engine, campana):
+    """Devuelve el id de una campaña por nombre (o None si no se pasa nombre)."""
+    if not campana:
+        return None
+    row = pd.read_sql(text("SELECT id FROM campanas WHERE nombre=:n"), engine, params={"n": campana})
+    return int(row["id"][0]) if not row.empty else None
+
+
+def _historico_a_csv_bytes(engine, campana_id=None):
+    """Lee el histórico de la base (filtrado por campaña si se indica) y lo devuelve como CSV en bytes."""
+    if campana_id is not None:
+        df = pd.read_sql(text("SELECT fecha, hora, cola, entrantes, atendidas, abandonadas "
+                              "FROM historico_llamadas WHERE campana_id=:c ORDER BY fecha, hora"),
+                         engine, params={"c": int(campana_id)})
+    else:
+        df = pd.read_sql(text("SELECT fecha, hora, cola, entrantes, atendidas, abandonadas "
+                              "FROM historico_llamadas ORDER BY fecha, hora"), engine)
     return df.to_csv(index=False).encode()
 
 
@@ -411,13 +458,15 @@ async def planeacion(
     paciencia: int = Form(90),
     estructura: str = Form("mixto"),
     absentismo: float = Form(0.15),
+    campana: str = Form("Endesa"),
 ):
     """Corre el optimizador y devuelve datos para graficar SIN escribir en la base."""
     check_key(x_api_key)
     if archivo is not None:
         file_bytes = await archivo.read()
     else:
-        file_bytes = _historico_a_csv_bytes(get_engine())
+        eng = get_engine()
+        file_bytes = _historico_a_csv_bytes(eng, _id_campana(eng, campana))
     largo_df = motor.largo_desde_historico(file_bytes, mes, "Nacional España", 4, 6, 0.0, mixto=False)
     S = motor.dimension_roster(largo_df, aht, sla, asa, occ, utl, esp_max, largo,
                                nda_obj, paciencia, estructura)
@@ -493,7 +542,7 @@ async def generar_roster(
     if archivo is not None:
         file_bytes = await archivo.read()
     else:
-        file_bytes = _historico_a_csv_bytes(engine)
+        file_bytes = _historico_a_csv_bytes(engine, _id_campana(engine, campana))
     largo_df = motor.largo_desde_historico(file_bytes, mes, "Nacional España", 4, 6, 0.0, mixto=False)
     S = motor.dimension_roster(largo_df, aht, sla, asa, occ, utl, esp_max, largo,
                                nda_obj, paciencia, estructura)
