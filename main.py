@@ -2033,3 +2033,150 @@ async def vacaciones_importar(
             "convertidas_de_otro_tipo": len(convertir),
             "ya_existian": ya_estaban,
             "dnis_sin_cruce": sorted(set(sin_cruce))}
+
+
+# ============================================================
+#  Agentes · Alta/actualización masiva por campaña (xlsx/csv)
+# ============================================================
+@app.post("/agentes/importar")
+async def agentes_importar(
+    campana: str,
+    x_api_key: str = Header(None),
+    archivo: UploadFile = File(...),
+):
+    """Monta o actualiza los agentes de una campaña. Cruza por 'dni': si existe lo actualiza
+    (solo campos con valor) y lo asigna a la campaña; si no, lo crea. Crea la campaña si no existe.
+    Crea también las filas de 'usuarios' (<dni>@agentes.wfm, rol agente).
+    Columnas: dni*, nombre, centro, pais, modo, turno, login_acd, fecha_alta,
+    jornada_horas, salario_mensual, vacaciones_anuales."""
+    check_key(x_api_key)
+    engine = get_engine()
+    from datetime import datetime, date as _date
+
+    raw = await archivo.read()
+    nombre_arch = (archivo.filename or "").lower()
+    if nombre_arch.endswith(".csv"):
+        df = pd.read_csv(io.BytesIO(raw), dtype=str)
+    else:
+        df = pd.read_excel(io.BytesIO(raw), dtype=str)
+    df.columns = [str(c).strip().lower() for c in df.columns]
+    if "dni" not in df.columns:
+        raise HTTPException(400, "El archivo debe tener una columna 'dni'.")
+
+    def S(v):
+        if v is None: return None
+        s = str(v).strip()
+        return s if s and s.lower() != "nan" else None
+
+    def N(v):
+        s = S(v)
+        if s is None: return None
+        try: return float(s.replace(",", "."))
+        except Exception: return None
+
+    def F(v):
+        s = S(v)
+        if s is None: return None
+        try: return pd.to_datetime(s).date().isoformat()
+        except Exception: return None
+
+    def pais_norm(p):
+        s = (S(p) or "").upper()
+        if s in ("CO", "COL", "COLOMBIA"): return "Colombia"
+        if s in ("ES", "ESP", "ESPANA", "ESPAÑA"): return "España"
+        return S(p)
+
+    filas = []
+    for _, r in df.iterrows():
+        dni = S(r.get("dni"))
+        if not dni: continue
+        p = pais_norm(r.get("pais"))
+        vac = N(r.get("vacaciones_anuales"))
+        if vac is None and p == "Colombia": vac = 15
+        if vac is None and p == "España":   vac = 23
+        filas.append({
+            "dni": dni.upper(), "nombre": S(r.get("nombre")),
+            "centro": (S(r.get("centro")) or "").upper() or None,
+            "pais": p, "modo": (S(r.get("modo")) or "").upper() or None,
+            "turno": (S(r.get("turno")) or "").upper() or None,
+            "login_acd": S(r.get("login_acd")), "fecha_alta": F(r.get("fecha_alta")),
+            "jornada_horas": N(r.get("jornada_horas")),
+            "salario_mensual": N(r.get("salario_mensual")),
+            "vacaciones_anuales": vac,
+        })
+    if not filas:
+        raise HTTPException(400, "No se encontraron filas con dni.")
+
+    with engine.begin() as conn:
+        camp = conn.execute(text("select id from campanas where nombre = :n"), {"n": campana}).fetchone()
+        if camp is None:
+            camp = conn.execute(text(
+                "insert into campanas (nombre) values (:n) returning id"), {"n": campana}).fetchone()
+            campana_creada = True
+        else:
+            campana_creada = False
+        id_camp = int(camp[0])
+
+        existentes = {str(x[0]).strip().upper(): int(x[1]) for x in
+                      conn.execute(text("select dni, id from agentes where dni is not null")).fetchall()}
+        nuevos = [f for f in filas if f["dni"] not in existentes]
+        upd    = [f for f in filas if f["dni"] in existentes]
+
+        cols = ["dni", "nombre", "centro", "pais", "modo", "turno", "login_acd",
+                "fecha_alta", "jornada_horas", "salario_mensual", "vacaciones_anuales"]
+        LOTE = 500
+        for k in range(0, len(nuevos), LOTE):
+            lote = nuevos[k:k + LOTE]
+            vals = []; params = {}
+            for j, f in enumerate(lote):
+                vals.append(f"(:dni{j}, :nombre{j}, :centro{j}, :pais{j}, :modo{j}, :turno{j}, "
+                            f":login_acd{j}, cast(:fecha_alta{j} as date), cast(:jornada_horas{j} as numeric), "
+                            f"cast(:salario_mensual{j} as numeric), cast(:vacaciones_anuales{j} as numeric), "
+                            f":camp{j}, 'activo')")
+                for c in cols: params[f"{c}{j}"] = f[c]
+                params[f"camp{j}"] = id_camp
+            conn.execute(text(
+                "insert into agentes (dni, nombre, centro, pais, modo, turno, login_acd, fecha_alta, "
+                "jornada_horas, salario_mensual, vacaciones_anuales, campana_id, estado) values "
+                + ",".join(vals)), params)
+
+        for k in range(0, len(upd), LOTE):
+            lote = upd[k:k + LOTE]
+            vals = []; params = {}
+            for j, f in enumerate(lote):
+                vals.append(f"(:dni{j}, :nombre{j}, :centro{j}, :pais{j}, :modo{j}, :turno{j}, "
+                            f":login_acd{j}, cast(:fecha_alta{j} as date), cast(:jornada_horas{j} as numeric), "
+                            f"cast(:salario_mensual{j} as numeric), cast(:vacaciones_anuales{j} as numeric), :camp{j})")
+                for c in cols: params[f"{c}{j}"] = f[c]
+                params[f"camp{j}"] = id_camp
+            conn.execute(text(
+                "update agentes a set "
+                "nombre = coalesce(v.nombre, a.nombre), centro = coalesce(v.centro, a.centro), "
+                "pais = coalesce(v.pais, a.pais), modo = coalesce(v.modo, a.modo), "
+                "turno = coalesce(v.turno, a.turno), login_acd = coalesce(v.login_acd, a.login_acd), "
+                "fecha_alta = coalesce(v.fecha_alta, a.fecha_alta), "
+                "jornada_horas = coalesce(v.jornada_horas, a.jornada_horas), "
+                "salario_mensual = coalesce(v.salario_mensual, a.salario_mensual), "
+                "vacaciones_anuales = coalesce(v.vacaciones_anuales, a.vacaciones_anuales), "
+                "campana_id = v.camp "
+                "from (values " + ",".join(vals) + ") as "
+                "v(dni, nombre, centro, pais, modo, turno, login_acd, fecha_alta, jornada_horas, "
+                "salario_mensual, vacaciones_anuales, camp) "
+                "where upper(a.dni) = v.dni"), params)
+
+        # usuarios: crear fila de login para agentes nuevos y vincular faltantes
+        conn.execute(text("""
+            insert into usuarios (email, rol, agente_id, activo)
+            select lower(a.dni) || '@agentes.wfm', 'agente', a.id, true
+            from agentes a
+            where a.dni is not null
+              and not exists (select 1 from usuarios u where u.email = lower(a.dni) || '@agentes.wfm')
+        """))
+        conn.execute(text("""
+            update usuarios u set agente_id = a.id
+            from agentes a
+            where u.agente_id is null and u.email = lower(a.dni) || '@agentes.wfm'
+        """))
+
+    return {"ok": True, "campana": campana, "campana_creada": campana_creada,
+            "agentes_creados": len(nuevos), "agentes_actualizados": len(upd)}
