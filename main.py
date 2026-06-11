@@ -802,6 +802,15 @@ async def detectar(
                 "codigos_detectados": _codigos_de_parrilla(rows, fila_cab, col_dni, cols_fecha),
             }
 
+    elif tipo_carga == "conexiones":
+        df2, fila_cab = _df_con_cabecera_auto(file_bytes, archivo.filename, hoja_activa)
+        columnas = list(df2.columns)
+        muestra = []
+        for _, rr in df2.head(3).iterrows():
+            muestra.append({c: (None if pd.isna(rr[c]) else str(rr[c])) for c in columnas})
+        cmap = {campo: _buscar_col(columnas, syns) for campo, syns in CONEXIONES_CAMPOS.items()}
+        sugerencia = {"fila_cabecera": fila_cab, "columnas": cmap}
+
     return {
         "ok": True,
         "tipo_carga": tipo_carga,
@@ -1343,6 +1352,56 @@ def _a_hora(v):
         return None
 
 
+# Sinónimos de columnas del ACD/conexiones (canónico -> prefijos para _buscar_col)
+CONEXIONES_CAMPOS = {
+    "fecha":            ["fecha", "date", "dia", "día"],
+    "plataforma":       ["plataforma", "platform"],
+    "login_acd":        ["agente", "usuario", "login_acd", "login acd", "extension", "extensión", "ext", "id agente"],
+    "logado":           ["logado", "logon", "login time", "hora login", "conexion", "conexión"],
+    "deslogado":        ["deslogado", "logoff", "logout", "desconexion", "desconexión"],
+    "seg_login":        ["total login", "tiempo login", "seg login"],
+    "seg_not_ready":    ["total not ready", "not ready", "no disponible", "aux"],
+    "seg_pausa_visual": ["total status 2", "pausa visual", "pausa"],
+    "seg_break":        ["total status 3", "break", "descanso"],
+    "seg_formacion":    ["total status 4", "formacion", "formación", "training"],
+    "seg_backoffice":   ["total status 5", "backoffice", "back office"],
+    "seg_servicios":    ["total status 6", "servicios"],
+    "seg_talk_in":      ["total talk time in", "talk in", "habla entrante"],
+    "seg_talk_out":     ["total talk time ou", "talk out", "habla saliente"],
+    "seg_hold":         ["total hold", "hold", "espera"],
+    "llamadas_inbound": ["total calls inboun", "calls inbound", "inbound", "llamadas"],
+}
+
+# Orden de campos numéricos (segundos) del ACD
+_ACD_SEGUNDOS = ["seg_login", "seg_not_ready", "seg_pausa_visual", "seg_break", "seg_formacion",
+                 "seg_servicios", "seg_backoffice", "seg_talk_in", "seg_talk_out", "seg_hold",
+                 "llamadas_inbound"]
+
+
+def _df_con_cabecera_auto(file_bytes, filename, hoja=None, fila_cabecera=None, clave="fecha"):
+    """Lee a df probando filas de cabecera (la fija, o 0..4) hasta encontrar 'clave'. (df, fila)."""
+    es_csv = (filename or "").lower().endswith(".csv")
+    intentos = [fila_cabecera] if fila_cabecera is not None else [0, 1, 2, 3, 4]
+    for h in intentos:
+        try:
+            if es_csv:
+                df = pd.read_csv(io.BytesIO(file_bytes), header=h, dtype=str)
+            else:
+                df = pd.read_excel(io.BytesIO(file_bytes), sheet_name=(hoja if hoja else 0), header=h, dtype=str)
+        except Exception:
+            continue
+        if any(clave in _norm_txt(c) for c in df.columns):
+            df.columns = [str(c).strip() for c in df.columns]
+            return df, (h if h is not None else 0)
+    # fallback: cabecera en la fila 0
+    if es_csv:
+        df = pd.read_csv(io.BytesIO(file_bytes), dtype=str)
+    else:
+        df = pd.read_excel(io.BytesIO(file_bytes), sheet_name=(hoja if hoja else 0), dtype=str)
+    df.columns = [str(c).strip() for c in df.columns]
+    return df, 0
+
+
 @app.post("/acd/importar")
 async def acd_importar(
     x_api_key: str = Header(None),
@@ -1447,6 +1506,112 @@ async def acd_importar(
     return {
         "ok": True,
         "filas_excel_validas": len(filas),
+        "total_filas_tabla": int(rep["filas"][0]),
+        "rango": {"desde": str(rep["desde"][0]), "hasta": str(rep["hasta"][0])},
+        "logins_distintos": int(rep["logins"][0]),
+        "logins_cruzados": int(rep["cruzados"][0]),
+        "logins_sin_cruzar": int(rep["sin_cruzar"][0]),
+        "ejemplos_sin_cruzar": sin["login_acd"].tolist(),
+    }
+
+
+@app.post("/conexiones/importar")
+async def conexiones_importar(
+    x_api_key: str = Header(None),
+    archivo: UploadFile = File(...),
+    campana: str = Form(...),
+):
+    """
+    Carga GENÉRICA de conexiones del ACD -> acd_resumen_diario, guiada por la config
+    'conexiones' de la campaña (campana_cargas): mapea columnas (canónico -> origen),
+    detecta la fila de cabecera, parsea tiempos en segundos y horas, y cruza por login_acd.
+    """
+    check_key(x_api_key)
+    engine = get_engine()
+    cid = _id_campana(engine, campana)
+    if cid is None:
+        raise HTTPException(400, f"La campaña '{campana}' no existe.")
+    cfg = _leer_config_carga(engine, cid, "conexiones")
+    if cfg is None:
+        raise HTTPException(400, f"La campaña '{campana}' no tiene config de carga 'conexiones'. Créala en el asistente.")
+    cmap_cfg = cfg.get("columnas") or {}
+    fmt_fecha = cfg.get("formato_fecha")  # ej '%Y%m%d'; None -> auto
+
+    file_bytes = await archivo.read()
+    df, _fila = _df_con_cabecera_auto(file_bytes, archivo.filename, cfg.get("hoja_datos"), cfg.get("fila_cabecera"))
+
+    # mapa canónico -> columna real (a partir del origen configurado)
+    mapa = {}
+    for campo in CONEXIONES_CAMPOS:
+        origen = cmap_cfg.get(campo)
+        mapa[campo] = _buscar_col(df.columns, [origen]) if origen else None
+    if not mapa.get("fecha") or not mapa.get("login_acd"):
+        raise HTTPException(400, f"Faltan columnas obligatorias fecha/login_acd en la config. Columnas: {list(df.columns)}")
+
+    def _fecha(v):
+        s = _a_txt(v)
+        if not s:
+            return None
+        try:
+            return (pd.to_datetime(s, format=fmt_fecha) if fmt_fecha else pd.to_datetime(s)).date()
+        except Exception:
+            return None
+
+    filas = []
+    for _, r in df.iterrows():
+        fecha = _fecha(r.get(mapa["fecha"]))
+        login_s = _a_txt(r.get(mapa["login_acd"]))
+        if not fecha or not login_s:
+            continue
+        fila = {
+            "fecha": fecha, "login_acd": login_s,
+            "plataforma": _a_txt(r.get(mapa["plataforma"])) if mapa.get("plataforma") else None,
+            "logado": _a_hora(r.get(mapa["logado"])) if mapa.get("logado") else None,
+            "deslogado": _a_hora(r.get(mapa["deslogado"])) if mapa.get("deslogado") else None,
+        }
+        for campo in _ACD_SEGUNDOS:
+            fila[campo] = _a_int(r.get(mapa[campo])) if mapa.get(campo) else 0
+        filas.append(fila)
+
+    if not filas:
+        raise HTTPException(400, "El archivo no tenía filas válidas (revisa el mapeo de fecha/login).")
+
+    cols = ["fecha", "plataforma", "login_acd", "logado", "deslogado", "seg_login",
+            "seg_not_ready", "seg_pausa_visual", "seg_break", "seg_formacion", "seg_servicios",
+            "seg_backoffice", "seg_talk_in", "seg_talk_out", "seg_hold", "llamadas_inbound"]
+    actualiza = ", ".join(f"{c}=EXCLUDED.{c}" for c in cols if c not in ("login_acd", "fecha"))
+    conflict = f" ON CONFLICT (login_acd, fecha) DO UPDATE SET {actualiza} "
+    LOTE = 500
+    try:
+        with engine.begin() as conn:
+            for k in range(0, len(filas), LOTE):
+                lote = filas[k:k + LOTE]
+                valores = []
+                params = {}
+                for j, f in enumerate(lote):
+                    valores.append("(" + ", ".join(f":{c}{j}" for c in cols) + ")")
+                    for c in cols:
+                        params[f"{c}{j}"] = f[c]
+                sql = "INSERT INTO acd_resumen_diario (" + ", ".join(cols) + ") VALUES " + ", ".join(valores) + conflict
+                conn.execute(text(sql), params)
+            conn.execute(text("""
+                UPDATE acd_resumen_diario d SET agente_id = a.id
+                FROM agentes a WHERE a.login_acd::text = d.login_acd
+            """))
+    except Exception as e:
+        raise HTTPException(500, f"Error al cargar conexiones: {type(e).__name__}: {str(e)[:300]}")
+
+    rep = pd.read_sql(text("""
+        SELECT COUNT(*) AS filas, MIN(fecha) AS desde, MAX(fecha) AS hasta,
+               COUNT(DISTINCT login_acd) AS logins,
+               COUNT(DISTINCT login_acd) FILTER (WHERE agente_id IS NOT NULL) AS cruzados,
+               COUNT(DISTINCT login_acd) FILTER (WHERE agente_id IS NULL) AS sin_cruzar
+        FROM acd_resumen_diario
+    """), engine)
+    sin = pd.read_sql(text("SELECT DISTINCT login_acd FROM acd_resumen_diario WHERE agente_id IS NULL ORDER BY login_acd LIMIT 30"), engine)
+    return {
+        "ok": True, "campana": campana,
+        "filas_validas": len(filas),
         "total_filas_tabla": int(rep["filas"][0]),
         "rango": {"desde": str(rep["desde"][0]), "hasta": str(rep["hasta"][0])},
         "logins_distintos": int(rep["logins"][0]),
