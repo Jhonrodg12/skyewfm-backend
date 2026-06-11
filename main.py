@@ -597,6 +597,39 @@ def _in_clause(prefijo, valores):
     return "(" + ph + ")", pr
 
 
+@app.get("/campanas")
+def campanas_list(x_api_key: str = Header(None)):
+    """Lista las campañas (para el selector del asistente)."""
+    check_key(x_api_key)
+    engine = get_engine()
+    df = pd.read_sql(text("SELECT id, nombre, pais_tipo FROM campanas ORDER BY nombre"), engine)
+    return {"ok": True, "campanas": df.to_dict(orient="records")}
+
+
+@app.post("/campanas")
+async def campanas_crear(
+    x_api_key: str = Header(None),
+    nombre: str = Form(...),
+    pais_tipo: str = Form("MIXTA"),
+):
+    """Crea una campaña (o la devuelve si ya existe). Usado por el Paso 0 del asistente."""
+    check_key(x_api_key)
+    engine = get_engine()
+    nom = (nombre or "").strip()
+    if not nom:
+        raise HTTPException(400, "El nombre de la campaña no puede estar vacío.")
+    pt = (pais_tipo or "MIXTA").strip().upper()
+    if pt not in ("ES", "CO", "MIXTA"):
+        pt = "MIXTA"
+    with engine.begin() as conn:
+        row = conn.execute(text("SELECT id, pais_tipo FROM campanas WHERE nombre=:n"), {"n": nom}).fetchone()
+        if row:
+            return {"ok": True, "id": int(row[0]), "nombre": nom, "pais_tipo": row[1], "creada": False}
+        rid = conn.execute(text("INSERT INTO campanas (nombre, pais_tipo) VALUES (:n, :pt) RETURNING id"),
+                           {"n": nom, "pt": pt}).fetchone()[0]
+    return {"ok": True, "id": int(rid), "nombre": nom, "pais_tipo": pt, "creada": True}
+
+
 @app.get("/campana-cargas")
 def campana_cargas_get(x_api_key: str = Header(None), campana: str = None, tipo_carga: str = "planeacion"):
     """Devuelve la config de carga de una campaña (para que el frontend elija el cargador)."""
