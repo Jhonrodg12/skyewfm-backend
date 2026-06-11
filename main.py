@@ -442,6 +442,212 @@ def _historico_a_csv_bytes(engine, campana_id=None):
     return df.to_csv(index=False).encode()
 
 
+# ============================================================
+#  PLANEACIÓN · Carga formato DIARIO + CURVA (campañas tipo EDP)
+#  Toma un volumen DIARIO (hoja de datos) y una curva intradía
+#  (hoja de curva, 24 intervalos x día de semana, suma 1.0) y
+#  expande cada día a 24 filas/hora, preservando el total diario.
+#  Escribe en historico_llamadas por campaña (el motor de planeación
+#  ya existente pronostica y dimensiona desde ahí, sin cambios).
+# ============================================================
+import unicodedata as _ud
+
+_DIAS_CURVA = ["Lunes", "Martes", "Miércoles", "Jueves", "Viernes", "Sábado", "Domingo"]
+
+
+def _norm_txt(s):
+    """minúsculas, sin tildes, sin espacios extra (para comparar nombres de columna)."""
+    s = str(s).strip().lower()
+    return "".join(c for c in _ud.normalize("NFKD", s) if not _ud.combining(c))
+
+
+def _col_por_nombre(columnas, *candidatos):
+    """Nombre real de la 1ª columna que coincide (exacta o por 'contiene', normalizada)."""
+    norm = {c: _norm_txt(c) for c in columnas}
+    for cand in candidatos:
+        cn = _norm_txt(cand)
+        for real, n in norm.items():
+            if n == cn:
+                return real
+        for real, n in norm.items():
+            if cn in n:
+                return real
+    return None
+
+
+def _curva_intradia_desde_excel(file_bytes, hoja="Curvas"):
+    """
+    Lee la curva intradía: localiza la fila de cabecera que contiene 'Intervalo',
+    luego una columna por día (Lunes..Domingo) y filas de intervalo 0..23.
+    Devuelve dict weekday(0=Lun..6=Dom) -> lista de 24 floats.
+    """
+    from openpyxl import load_workbook
+    wb = load_workbook(io.BytesIO(file_bytes), read_only=True, data_only=True)
+    if hoja not in wb.sheetnames:
+        raise HTTPException(400, f"No encuentro la hoja de curva '{hoja}'. Hojas: {wb.sheetnames}")
+    ws = wb[hoja]
+    filas = list(ws.iter_rows(values_only=True))
+    hi = None
+    for i, r in enumerate(filas):
+        if "intervalo" in [_norm_txt(x) for x in r if x is not None]:
+            hi = i
+            break
+    if hi is None:
+        raise HTTPException(400, f"No encuentro la cabecera 'Intervalo' en la hoja '{hoja}'.")
+    header = filas[hi]
+    idx_int = None
+    idx_dia = {}
+    for ci, c in enumerate(header):
+        n = _norm_txt(c)
+        if n == "intervalo":
+            idx_int = ci
+        for d, nom in enumerate(_DIAS_CURVA):
+            if n == _norm_txt(nom):
+                idx_dia[d] = ci
+    if idx_int is None or len(idx_dia) < 7:
+        raise HTTPException(400, f"La curva '{hoja}' no tiene 'Intervalo' + 7 días. Cabecera vista: {list(header)}")
+    curva = {d: [0.0] * 24 for d in range(7)}
+    for r in filas[hi + 1:]:
+        try:
+            h = int(r[idx_int])
+        except (TypeError, ValueError):
+            continue
+        if 0 <= h <= 23:
+            for d in range(7):
+                v = r[idx_dia[d]]
+                curva[d][h] = float(v) if v is not None else 0.0
+    return curva
+
+
+def _reparte_entero(total, pesos):
+    """Reparte 'total' (entero) según 'pesos' preservando la suma exacta (mayor resto)."""
+    if total <= 0:
+        return [0] * len(pesos)
+    crudos = [total * w for w in pesos]
+    base = [int(x) for x in crudos]
+    resto = int(round(total - sum(base)))
+    orden = sorted(range(len(pesos)), key=lambda i: (crudos[i] - base[i]), reverse=True)
+    for k in range(resto):
+        base[orden[k % len(orden)]] += 1
+    return base
+
+
+@app.post("/historico/importar-diario-curva")
+async def historico_importar_diario_curva(
+    x_api_key: str = Header(None),
+    archivo: UploadFile = File(...),
+    campana: str = Form("EDP"),
+    cola: str = Form("General+Averias"),
+    hoja_datos: str = Form("BD"),
+    hoja_curva: str = Form("Curvas"),
+    excluir_tipo_general: str = Form("C2C"),  # 'Tipo General' a excluir, separados por coma
+    reemplazar: bool = Form(False),           # True: borra antes el histórico de (campaña, cola)
+):
+    """
+    Carga de planeación para campañas con volumen DIARIO + curva (formato EDP):
+      1. Lee la hoja de datos (def. 'BD'): FECHA, 'Tipo General', 'LLAMADAS ENTRANTES'
+         (la comercializadora se ignora: se suma todo).
+      2. Excluye los 'Tipo General' indicados (def. C2C) y agrega por fecha -> total diario.
+      3. Lee la curva intradía (def. hoja 'Curvas', 24 intervalos x día de semana).
+      4. Expande cada día -> 24 filas/hora preservando el total diario exacto.
+      5. Upsert en historico_llamadas (fecha,hora,cola,campana_id). atendidas=entrantes,
+         abandonadas=0 (EDP sólo aporta entrantes).
+    """
+    check_key(x_api_key)
+    engine = get_engine()
+    cid = _id_campana(engine, campana)
+    if cid is None:
+        raise HTTPException(400, f"La campaña '{campana}' no existe.")
+
+    file_bytes = await archivo.read()
+
+    # 1) hoja de datos diarios
+    try:
+        df = pd.read_excel(io.BytesIO(file_bytes), sheet_name=hoja_datos, engine="openpyxl")
+    except Exception as e:
+        raise HTTPException(400, f"No pude leer la hoja '{hoja_datos}': {type(e).__name__}: {e}")
+    df.columns = [str(c).strip() for c in df.columns]
+    c_fecha = _col_por_nombre(df.columns, "FECHA")
+    c_tipog = _col_por_nombre(df.columns, "Tipo General", "tipogeneral")
+    c_llam = _col_por_nombre(df.columns, "LLAMADAS ENTRANTES", "entrantes", "llamadas")
+    if not c_fecha or not c_llam:
+        raise HTTPException(400, f"Faltan columnas FECHA/LLAMADAS ENTRANTES. Vi: {list(df.columns)}")
+
+    usar = [c for c in [c_fecha, c_tipog, c_llam] if c]
+    df = df[usar].copy()
+    df[c_fecha] = pd.to_datetime(df[c_fecha], errors="coerce")
+    df = df.dropna(subset=[c_fecha])
+    df[c_llam] = pd.to_numeric(df[c_llam], errors="coerce").fillna(0)
+
+    total_bruto = int(df[c_llam].sum())
+    excl = {_norm_txt(x) for x in str(excluir_tipo_general).split(",") if x.strip()}
+    if c_tipog and excl:
+        df = df[~df[c_tipog].map(_norm_txt).isin(excl)]
+    if df.empty:
+        raise HTTPException(400, "No quedaron filas tras filtrar (revisa hoja/columnas/tipos excluidos).")
+
+    diario = df.groupby(df[c_fecha].dt.date)[c_llam].sum()
+    diario = {f: int(round(v)) for f, v in diario.items()}
+
+    # 2) curva intradía
+    curva = _curva_intradia_desde_excel(file_bytes, hoja_curva)
+
+    # 3) expandir a 24 filas/hora
+    filas = []
+    for f, total in diario.items():
+        pesos = curva.get(f.weekday(), [1 / 24] * 24)
+        s = sum(pesos)
+        pesos = [p / s for p in pesos] if s > 0 else [1 / 24] * 24
+        por_hora = _reparte_entero(total, pesos)
+        for h in range(24):
+            if por_hora[h] > 0:
+                filas.append({"f": f, "h": h, "e": por_hora[h]})
+    if not filas:
+        raise HTTPException(400, "No se generaron filas tras expandir con la curva.")
+
+    # 4) escribir
+    insertadas = 0
+    with engine.begin() as conn:
+        if reemplazar:
+            conn.execute(text("DELETE FROM historico_llamadas WHERE campana_id=:c AND cola=:k"),
+                         {"c": cid, "k": cola})
+        LOTE = 500
+        for k in range(0, len(filas), LOTE):
+            lote = filas[k:k + LOTE]
+            vals = []
+            params = {"c": cola, "cid": cid}
+            for j, r in enumerate(lote):
+                vals.append(f"(:f{j}, :h{j}, :c, :e{j}, :e{j}, 0, :cid, now())")
+                params[f"f{j}"] = r["f"]
+                params[f"h{j}"] = r["h"]
+                params[f"e{j}"] = r["e"]
+            sql = ("INSERT INTO historico_llamadas "
+                   "(fecha, hora, cola, entrantes, atendidas, abandonadas, campana_id, actualizado_en) "
+                   "VALUES " + ", ".join(vals) +
+                   " ON CONFLICT (fecha, hora, cola, campana_id) DO UPDATE SET "
+                   "entrantes=EXCLUDED.entrantes, atendidas=EXCLUDED.atendidas, "
+                   "abandonadas=EXCLUDED.abandonadas, actualizado_en=now()")
+            conn.execute(text(sql), params)
+            insertadas += len(lote)
+
+    rango = pd.read_sql(text("SELECT MIN(fecha) d, MAX(fecha) h, COUNT(*) n, COALESCE(SUM(entrantes),0) e "
+                             "FROM historico_llamadas WHERE campana_id=:c AND cola=:k"),
+                        engine, params={"c": cid, "k": cola})
+    return {
+        "ok": True,
+        "campana": campana,
+        "cola": cola,
+        "total_entrantes_bruto": total_bruto,
+        "tipos_excluidos": sorted(excl),
+        "dias_cargados": len(diario),
+        "filas_hora_insertadas": insertadas,
+        "historico_desde": str(rango["d"][0]),
+        "historico_hasta": str(rango["h"][0]),
+        "total_filas_cola": int(rango["n"][0]),
+        "total_entrantes_cola": int(rango["e"][0]),
+    }
+
+
 @app.post("/planeacion")
 async def planeacion(
     x_api_key: str = Header(None),
