@@ -443,12 +443,13 @@ def _historico_a_csv_bytes(engine, campana_id=None):
 
 
 # ============================================================
-#  PLANEACIÓN · Carga formato DIARIO + CURVA (campañas tipo EDP)
-#  Toma un volumen DIARIO (hoja de datos) y una curva intradía
-#  (hoja de curva, 24 intervalos x día de semana, suma 1.0) y
-#  expande cada día a 24 filas/hora, preservando el total diario.
-#  Escribe en historico_llamadas por campaña (el motor de planeación
-#  ya existente pronostica y dimensiona desde ahí, sin cambios).
+#  PLANEACIÓN · Carga GENÉRICA de histórico, guiada por config
+#  por campaña (tabla campana_cargas). Soporta:
+#    - formato 'intervalo'    (datos por intervalo 60/30/15 -> agrega a hora)
+#    - formato 'diario_curva' (volumen diario + curva -> expande a 24 h)
+#  Colas configurables (1..N) con reglas 'incluye'. Escribe en
+#  historico_llamadas a granularidad HORARIA. Sin código por campaña.
+#  (Helpers de curva/columnas/reparto compartidos por ambos formatos.)
 # ============================================================
 import unicodedata as _ud
 
@@ -532,94 +533,233 @@ def _reparte_entero(total, pesos):
     return base
 
 
-@app.post("/historico/importar-diario-curva")
-async def historico_importar_diario_curva(
+def _leer_config_carga(engine, cid, tipo_carga="planeacion"):
+    """Lee la config de carga (jsonb) de una campaña, o None si no existe."""
+    row = pd.read_sql(text("SELECT config FROM campana_cargas WHERE campana_id=:c AND tipo_carga=:t"),
+                      engine, params={"c": cid, "t": tipo_carga})
+    if row.empty:
+        return None
+    import json
+    cfg = row["config"][0]
+    if isinstance(cfg, str):
+        cfg = json.loads(cfg)
+    return cfg
+
+
+def _leer_tabla(file_bytes, filename, hoja=None):
+    """Lee el archivo a DataFrame: CSV si termina en .csv, si no Excel (hoja indicada o la 1ª)."""
+    nombre = (filename or "").lower()
+    if nombre.endswith(".csv"):
+        return pd.read_csv(io.BytesIO(file_bytes))
+    return pd.read_excel(io.BytesIO(file_bytes), sheet_name=(hoja if hoja else 0), engine="openpyxl")
+
+
+def _a_hora_de_intervalo(valor, granularidad_min):
+    """
+    Convierte el valor de la columna de intervalo a una HORA 0-23 (para agregar a hora).
+    Acepta: 'HH:MM[:SS]' (o un time de Excel, que se vuelve texto con ':'),
+            un entero 0-23 cuando la granularidad es 60,
+            o un ÍNDICE de intervalo (0..N-1) -> (idx*gran)//60.
+    """
+    if valor is None:
+        return None
+    s = str(valor).strip()
+    if not s or s.lower() == "nan":
+        return None
+    if ":" in s:
+        try:
+            p = s.split(":")
+            return (int(p[0]) * 60 + int(float(p[1]))) // 60 % 24
+        except Exception:
+            return None
+    try:
+        x = float(s)
+    except Exception:
+        return None
+    g = int(granularidad_min or 60)
+    if g >= 60 and 0 <= x <= 23:
+        return int(x)
+    return (int(round(x)) * g // 60) % 24
+
+
+def _filtra_por_grupo(df, col_grupo_real, incluye):
+    """Filtra el DataFrame a los valores 'incluye' de la columna de grupo. incluye=None -> todo."""
+    if not col_grupo_real or incluye is None:
+        return df
+    vals = {_norm_txt(x) for x in incluye}
+    return df[df[col_grupo_real].map(_norm_txt).isin(vals)]
+
+
+def _in_clause(prefijo, valores):
+    """Construye '(:p0, :p1, ...)' + sus params (IN portable Postgres/SQLite)."""
+    ph = ", ".join(f":{prefijo}{i}" for i in range(len(valores)))
+    pr = {f"{prefijo}{i}": v for i, v in enumerate(valores)}
+    return "(" + ph + ")", pr
+
+
+@app.get("/campana-cargas")
+def campana_cargas_get(x_api_key: str = Header(None), campana: str = None, tipo_carga: str = "planeacion"):
+    """Devuelve la config de carga de una campaña (para que el frontend elija el cargador)."""
+    check_key(x_api_key)
+    engine = get_engine()
+    cid = _id_campana(engine, campana)
+    if cid is None:
+        raise HTTPException(400, f"La campaña '{campana}' no existe.")
+    cfg = _leer_config_carga(engine, cid, tipo_carga)
+    if cfg is None:
+        # Sin config -> formato clásico (CSV por intervalo de Endesa, endpoint /historico/actualizar)
+        return {"ok": True, "tiene_config": False, "formato": "csv_clasico", "tipo_carga": tipo_carga}
+    return {"ok": True, "tiene_config": True, "formato": cfg.get("formato"),
+            "tipo_carga": tipo_carga, "config": cfg}
+
+
+@app.post("/campana-cargas")
+async def campana_cargas_post(
+    x_api_key: str = Header(None),
+    campana: str = Form(...),
+    tipo_carga: str = Form("planeacion"),
+    config: str = Form(...),  # JSON (string)
+):
+    """Crea/actualiza la config de carga de una campaña (alta sin tocar código)."""
+    check_key(x_api_key)
+    import json
+    engine = get_engine()
+    cid = _id_campana(engine, campana)
+    if cid is None:
+        raise HTTPException(400, f"La campaña '{campana}' no existe.")
+    try:
+        cfg = json.loads(config)
+    except Exception as e:
+        raise HTTPException(400, f"'config' no es JSON válido: {e}")
+    with engine.begin() as conn:
+        conn.execute(text("""
+            INSERT INTO campana_cargas (campana_id, tipo_carga, config, actualizado_en)
+            VALUES (:c, :t, cast(:cfg as jsonb), now())
+            ON CONFLICT (campana_id, tipo_carga)
+            DO UPDATE SET config = EXCLUDED.config, actualizado_en = now()
+        """), {"c": cid, "t": tipo_carga, "cfg": json.dumps(cfg)})
+    return {"ok": True, "campana": campana, "tipo_carga": tipo_carga, "config": cfg}
+
+
+@app.post("/historico/importar")
+async def historico_importar(
     x_api_key: str = Header(None),
     archivo: UploadFile = File(...),
-    campana: str = Form("EDP"),
-    cola: str = Form("General+Averias"),
-    hoja_datos: str = Form("BD"),
-    hoja_curva: str = Form("Curvas"),
-    excluir_tipo_general: str = Form("C2C"),  # 'Tipo General' a excluir, separados por coma
-    reemplazar: bool = Form(False),           # True: borra antes el histórico de (campaña, cola)
+    campana: str = Form(...),
+    tipo_carga: str = Form("planeacion"),
+    reemplazar: bool = Form(False),   # True: borra antes el histórico de las colas tocadas
 ):
     """
-    Carga de planeación para campañas con volumen DIARIO + curva (formato EDP):
-      1. Lee la hoja de datos (def. 'BD'): FECHA, 'Tipo General', 'LLAMADAS ENTRANTES'
-         (la comercializadora se ignora: se suma todo).
-      2. Excluye los 'Tipo General' indicados (def. C2C) y agrega por fecha -> total diario.
-      3. Lee la curva intradía (def. hoja 'Curvas', 24 intervalos x día de semana).
-      4. Expande cada día -> 24 filas/hora preservando el total diario exacto.
-      5. Upsert en historico_llamadas (fecha,hora,cola,campana_id). atendidas=entrantes,
-         abandonadas=0 (EDP sólo aporta entrantes).
+    Carga GENÉRICA de histórico de planeación, guiada por la config de la campaña
+    (tabla campana_cargas, tipo_carga='planeacion'). Soporta dos formatos:
+
+      • formato 'intervalo'  -> el archivo ya trae datos por intervalo (granularidad
+        60/30/15 min, campo 'granularidad_min'). Se AGREGAN a HORA (0-23) y se escriben.
+      • formato 'diario_curva' -> volumen DIARIO + hoja de curva intradía; cada día se
+        EXPANDE a 24 horas con la curva, preservando el total diario exacto.
+
+    Las 'colas' se definen en la config (1..N), cada una con su 'incluye' (lista de
+    valores de la columna de grupo, o null = todo). Escribe en historico_llamadas a
+    granularidad HORARIA (el motor dimensiona por hora). Sin código específico de campaña.
     """
     check_key(x_api_key)
     engine = get_engine()
     cid = _id_campana(engine, campana)
     if cid is None:
         raise HTTPException(400, f"La campaña '{campana}' no existe.")
+    cfg = _leer_config_carga(engine, cid, tipo_carga)
+    if cfg is None:
+        raise HTTPException(400, f"La campaña '{campana}' no tiene config de carga '{tipo_carga}'. "
+                                 f"Créala en /campana-cargas o usa el cargador CSV clásico.")
+
+    formato = str(cfg.get("formato", "")).lower()
+    col_fecha_cfg = cfg.get("col_fecha", "fecha")
+    col_vol_cfg = cfg.get("col_volumen", "entrantes")
+    col_grupo_cfg = cfg.get("col_grupo")
+    colas_cfg = cfg.get("colas") or [{"nombre": "Total", "incluye": None}]
+    hoja_datos = cfg.get("hoja_datos")
+    gran = int(cfg.get("granularidad_min", 60) or 60)
 
     file_bytes = await archivo.read()
-
-    # 1) hoja de datos diarios
     try:
-        df = pd.read_excel(io.BytesIO(file_bytes), sheet_name=hoja_datos, engine="openpyxl")
+        df = _leer_tabla(file_bytes, archivo.filename, hoja_datos)
     except Exception as e:
-        raise HTTPException(400, f"No pude leer la hoja '{hoja_datos}': {type(e).__name__}: {e}")
+        raise HTTPException(400, f"No pude leer los datos (hoja '{hoja_datos}'): {type(e).__name__}: {e}")
     df.columns = [str(c).strip() for c in df.columns]
-    c_fecha = _col_por_nombre(df.columns, "FECHA")
-    c_tipog = _col_por_nombre(df.columns, "Tipo General", "tipogeneral")
-    c_llam = _col_por_nombre(df.columns, "LLAMADAS ENTRANTES", "entrantes", "llamadas")
-    if not c_fecha or not c_llam:
-        raise HTTPException(400, f"Faltan columnas FECHA/LLAMADAS ENTRANTES. Vi: {list(df.columns)}")
 
-    usar = [c for c in [c_fecha, c_tipog, c_llam] if c]
-    df = df[usar].copy()
+    c_fecha = _col_por_nombre(df.columns, col_fecha_cfg)
+    c_vol = _col_por_nombre(df.columns, col_vol_cfg, "entrantes", "llamadas", "volumen")
+    c_grupo = _col_por_nombre(df.columns, col_grupo_cfg) if col_grupo_cfg else None
+    if not c_fecha or not c_vol:
+        raise HTTPException(400, f"No encuentro columnas fecha='{col_fecha_cfg}' / volumen='{col_vol_cfg}'. "
+                                 f"Columnas vistas: {list(df.columns)}")
     df[c_fecha] = pd.to_datetime(df[c_fecha], errors="coerce")
     df = df.dropna(subset=[c_fecha])
-    df[c_llam] = pd.to_numeric(df[c_llam], errors="coerce").fillna(0)
+    df[c_vol] = pd.to_numeric(df[c_vol], errors="coerce").fillna(0)
+    total_bruto = int(df[c_vol].sum())
 
-    total_bruto = int(df[c_llam].sum())
-    excl = {_norm_txt(x) for x in str(excluir_tipo_general).split(",") if x.strip()}
-    if c_tipog and excl:
-        df = df[~df[c_tipog].map(_norm_txt).isin(excl)]
-    if df.empty:
-        raise HTTPException(400, "No quedaron filas tras filtrar (revisa hoja/columnas/tipos excluidos).")
+    filas = []          # {f, h, c(cola), e}
+    resumen_colas = []  # por cola: dias, entrantes, filas_hora
 
-    diario = df.groupby(df[c_fecha].dt.date)[c_llam].sum()
-    diario = {f: int(round(v)) for f, v in diario.items()}
+    if formato == "diario_curva":
+        curva = _curva_intradia_desde_excel(file_bytes, cfg.get("hoja_curva", "Curvas"))
+        for cola in colas_cfg:
+            nombre = cola["nombre"]
+            sub = _filtra_por_grupo(df, c_grupo, cola.get("incluye"))
+            diario = {f: int(round(v)) for f, v in sub.groupby(sub[c_fecha].dt.date)[c_vol].sum().items()}
+            nf = tot = 0
+            for f, total in diario.items():
+                pesos = curva.get(f.weekday(), [1 / 24] * 24)
+                s = sum(pesos)
+                pesos = [p / s for p in pesos] if s > 0 else [1 / 24] * 24
+                ph = _reparte_entero(total, pesos)
+                for h in range(24):
+                    if ph[h] > 0:
+                        filas.append({"f": f, "h": h, "c": nombre, "e": ph[h]}); nf += 1; tot += ph[h]
+            resumen_colas.append({"cola": nombre, "dias": len(diario), "entrantes": tot, "filas_hora": nf})
 
-    # 2) curva intradía
-    curva = _curva_intradia_desde_excel(file_bytes, hoja_curva)
+    elif formato == "intervalo":
+        c_int = _col_por_nombre(df.columns, cfg.get("col_intervalo", "hora"), "hora", "intervalo")
+        if not c_int:
+            raise HTTPException(400, f"Formato 'intervalo' requiere columna de intervalo "
+                                     f"'{cfg.get('col_intervalo', 'hora')}'. Columnas: {list(df.columns)}")
+        df["_hora"] = df[c_int].map(lambda v: _a_hora_de_intervalo(v, gran))
+        df = df.dropna(subset=["_hora"])
+        df["_hora"] = df["_hora"].astype(int)
+        for cola in colas_cfg:
+            nombre = cola["nombre"]
+            sub = _filtra_por_grupo(df, c_grupo, cola.get("incluye"))
+            agg = sub.groupby([sub[c_fecha].dt.date, "_hora"])[c_vol].sum()
+            dias = set(); nf = tot = 0
+            for (f, h), v in agg.items():
+                e = int(round(v))
+                if e > 0:
+                    filas.append({"f": f, "h": int(h), "c": nombre, "e": e})
+                    nf += 1; tot += e; dias.add(f)
+            resumen_colas.append({"cola": nombre, "dias": len(dias), "entrantes": tot, "filas_hora": nf})
+    else:
+        raise HTTPException(400, f"Formato de carga no soportado: '{formato}'. Usa 'intervalo' o 'diario_curva'.")
 
-    # 3) expandir a 24 filas/hora
-    filas = []
-    for f, total in diario.items():
-        pesos = curva.get(f.weekday(), [1 / 24] * 24)
-        s = sum(pesos)
-        pesos = [p / s for p in pesos] if s > 0 else [1 / 24] * 24
-        por_hora = _reparte_entero(total, pesos)
-        for h in range(24):
-            if por_hora[h] > 0:
-                filas.append({"f": f, "h": h, "e": por_hora[h]})
     if not filas:
-        raise HTTPException(400, "No se generaron filas tras expandir con la curva.")
+        raise HTTPException(400, "No se generaron filas (revisa columnas, colas/incluye y datos).")
 
-    # 4) escribir
+    nombres_colas = sorted({fl["c"] for fl in filas})
     insertadas = 0
     with engine.begin() as conn:
         if reemplazar:
-            conn.execute(text("DELETE FROM historico_llamadas WHERE campana_id=:c AND cola=:k"),
-                         {"c": cid, "k": cola})
+            inc, pin = _in_clause("k", nombres_colas)
+            conn.execute(text(f"DELETE FROM historico_llamadas WHERE campana_id=:c AND cola IN {inc}"),
+                         {"c": cid, **pin})
         LOTE = 500
         for k in range(0, len(filas), LOTE):
             lote = filas[k:k + LOTE]
             vals = []
-            params = {"c": cola, "cid": cid}
+            params = {"cid": cid}
             for j, r in enumerate(lote):
-                vals.append(f"(:f{j}, :h{j}, :c, :e{j}, :e{j}, 0, :cid, now())")
+                vals.append(f"(:f{j}, :h{j}, :c{j}, :e{j}, :e{j}, 0, :cid, now())")
                 params[f"f{j}"] = r["f"]
                 params[f"h{j}"] = r["h"]
+                params[f"c{j}"] = r["c"]
                 params[f"e{j}"] = r["e"]
             sql = ("INSERT INTO historico_llamadas "
                    "(fecha, hora, cola, entrantes, atendidas, abandonadas, campana_id, actualizado_en) "
@@ -630,21 +770,22 @@ async def historico_importar_diario_curva(
             conn.execute(text(sql), params)
             insertadas += len(lote)
 
+    inc, pin = _in_clause("k", nombres_colas)
     rango = pd.read_sql(text("SELECT MIN(fecha) d, MAX(fecha) h, COUNT(*) n, COALESCE(SUM(entrantes),0) e "
-                             "FROM historico_llamadas WHERE campana_id=:c AND cola=:k"),
-                        engine, params={"c": cid, "k": cola})
+                             f"FROM historico_llamadas WHERE campana_id=:c AND cola IN {inc}"),
+                        engine, params={"c": cid, **pin})
     return {
         "ok": True,
         "campana": campana,
-        "cola": cola,
+        "formato": formato,
+        "granularidad_min": gran,
         "total_entrantes_bruto": total_bruto,
-        "tipos_excluidos": sorted(excl),
-        "dias_cargados": len(diario),
+        "colas": resumen_colas,
         "filas_hora_insertadas": insertadas,
         "historico_desde": str(rango["d"][0]),
         "historico_hasta": str(rango["h"][0]),
-        "total_filas_cola": int(rango["n"][0]),
-        "total_entrantes_cola": int(rango["e"][0]),
+        "total_filas": int(rango["n"][0]),
+        "total_entrantes": int(rango["e"][0]),
     }
 
 
