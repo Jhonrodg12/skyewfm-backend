@@ -535,7 +535,8 @@ def _reparte_entero(total, pesos):
 
 def _leer_config_carga(engine, cid, tipo_carga="planeacion"):
     """Lee la config de carga (jsonb) de una campaña, o None si no existe."""
-    row = pd.read_sql(text("SELECT config FROM campana_cargas WHERE campana_id=:c AND tipo_carga=:t"),
+    tipo_carga = (tipo_carga or "planeacion").strip().lower()
+    row = pd.read_sql(text("SELECT config FROM campana_cargas WHERE campana_id=:c AND lower(tipo_carga)=:t"),
                       engine, params={"c": cid, "t": tipo_carga})
     if row.empty:
         return None
@@ -634,6 +635,7 @@ async def campanas_crear(
 def campana_cargas_get(x_api_key: str = Header(None), campana: str = None, tipo_carga: str = "planeacion"):
     """Devuelve la config de carga de una campaña (para que el frontend elija el cargador)."""
     check_key(x_api_key)
+    tipo_carga = (tipo_carga or "planeacion").strip().lower()
     engine = get_engine()
     cid = _id_campana(engine, campana)
     if cid is None:
@@ -655,6 +657,7 @@ async def campana_cargas_post(
 ):
     """Crea/actualiza la config de carga de una campaña (alta sin tocar código)."""
     check_key(x_api_key)
+    tipo_carga = (tipo_carga or "planeacion").strip().lower()
     import json
     engine = get_engine()
     cid = _id_campana(engine, campana)
@@ -703,6 +706,7 @@ async def detectar(
     de filas y un mapeo SUGERIDO (fuzzy-match). Pensado para el flujo "cargar y mapear".
     """
     check_key(x_api_key)
+    tipo_carga = (tipo_carga or "planeacion").strip().lower()
     file_bytes = await archivo.read()
     nombre = (archivo.filename or "").lower()
     es_csv = nombre.endswith(".csv")
@@ -816,6 +820,7 @@ async def historico_importar(
     granularidad HORARIA (el motor dimensiona por hora). Sin código específico de campaña.
     """
     check_key(x_api_key)
+    tipo_carga = (tipo_carga or "planeacion").strip().lower()
     engine = get_engine()
     cid = _id_campana(engine, campana)
     if cid is None:
