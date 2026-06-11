@@ -786,6 +786,22 @@ async def detectar(
         cols_map = {campo: _col_por_nombre(columnas, *syns) for campo, syns in AGENTES_CAMPOS.items()}
         sugerencia = {"columnas": cols_map}
 
+    elif tipo_carga == "turnos":
+        if es_csv:
+            sugerencia = {"aviso": "La parrilla de turnos debe ser un Excel (.xlsx/.xlsm)."}
+        else:
+            from openpyxl import load_workbook
+            wb2 = load_workbook(io.BytesIO(file_bytes), read_only=True, data_only=True)
+            sn = hoja_activa if hoja_activa in wb2.sheetnames else (wb2.sheetnames[0] if wb2.sheetnames else None)
+            rows = list(wb2[sn].iter_rows(values_only=True)) if sn else []
+            fila_cab, col_dni, cols_fecha = _detecta_layout_parrilla(rows)
+            sugerencia = {
+                "fila_cabecera": fila_cab,
+                "col_dni": col_dni,
+                "n_fechas": len(cols_fecha),
+                "codigos_detectados": _codigos_de_parrilla(rows, fila_cab, col_dni, cols_fecha),
+            }
+
     return {
         "ok": True,
         "tipo_carga": tipo_carga,
@@ -1661,6 +1677,91 @@ def _mes_de_hoja(nombre):
     return None
 
 
+def _par_celda_cfg(valor, codigos):
+    """
+    Versión genérica de _par_celda guiada por la config 'codigos' de la campaña.
+    - rango(s) horario(s) 'HH:MM-HH:MM' (también partidos con '/') -> ('trabajo', hi, hf)  [universal]
+    - código de texto presente en 'codigos' -> usa su tipo (o {tipo,hora_inicio,hora_fin})
+    - vacío -> None ; no reconocible -> 'SKIP'
+    'codigos' es {CODE_MAYUS: "libre"|"vacaciones"|"ausencia"|"trabajo"|"ignorar"
+                           | {"tipo":..., "hora_inicio":"HH:MM", "hora_fin":"HH:MM"}}
+    """
+    if valor is None:
+        return None
+    s = str(valor).strip()
+    if not s:
+        return None
+    up = s.upper()
+    if up in codigos:
+        spec = codigos[up]
+        if isinstance(spec, dict):
+            return (spec.get("tipo", "trabajo"), spec.get("hora_inicio"), spec.get("hora_fin"))
+        if str(spec).lower() == "ignorar":
+            return None
+        return (str(spec), None, None)
+    # rango(s) horario(s) -> trabajo
+    primer_ini, total_dur = None, 0
+    for seg in s.split("/"):
+        r = _par_segmento(seg)
+        if r is None:
+            return "SKIP"
+        ini, dur = r
+        if primer_ini is None:
+            primer_ini = ini
+        total_dur += dur
+    if primer_ini is None or total_dur <= 0:
+        return "SKIP"
+    hi = f"{(primer_ini // 60) % 24:02d}:{primer_ini % 60:02d}"
+    fin_min = (primer_ini + total_dur) % (24 * 60)
+    hf = f"{fin_min // 60:02d}:{fin_min % 60:02d}"
+    return ("trabajo", hi, hf)
+
+
+def _detecta_layout_parrilla(rows, col_dni_cfg=None, fila_cab_cfg=None):
+    """Detecta (fila_cabecera, col_dni, [(ci, date)...]) en una parrilla matricial."""
+    if fila_cab_cfg is not None:
+        fila_cab = int(fila_cab_cfg)
+    else:
+        fila_cab, mejor = 0, -1
+        for i, r in enumerate(rows[:15]):
+            nd = sum(1 for c in r if isinstance(c, datetime))
+            if nd > mejor:
+                mejor, fila_cab = nd, i
+    header = rows[fila_cab] if fila_cab < len(rows) else ()
+    cols_fecha = [(ci, c.date()) for ci, c in enumerate(header) if isinstance(c, datetime)]
+    if col_dni_cfg is not None:
+        col_dni = int(col_dni_cfg)
+    else:
+        col_dni = None
+        for ci, c in enumerate(header):
+            if c is not None and _norm_txt(c) in ("dni", "documento", "cedula", "nif", "id"):
+                col_dni = ci
+                break
+        if col_dni is None:
+            col_dni = 2
+    return fila_cab, col_dni, cols_fecha
+
+
+def _codigos_de_parrilla(rows, fila_cab, col_dni, cols_fecha, maxn=80):
+    """Códigos de texto distintos (no horarios, no vacíos) hallados en las celdas de fecha."""
+    cods = {}
+    for r in rows[fila_cab + 1:]:
+        for ci, _ in cols_fecha:
+            if ci >= len(r):
+                continue
+            v = r[ci]
+            if v is None:
+                continue
+            s = str(v).strip()
+            if not s:
+                continue
+            if all(_par_segmento(seg) is not None for seg in s.split("/")):
+                continue  # es un horario -> trabajo, no es "código"
+            up = s.upper()
+            cods[up] = cods.get(up, 0) + 1
+    return [k for k, _ in sorted(cods.items(), key=lambda x: x[1], reverse=True)][:maxn]
+
+
 @app.post("/asignaciones/importar-parrilla")
 async def importar_parrilla(
     x_api_key: str = Header(None),
@@ -1769,6 +1870,116 @@ async def importar_parrilla(
     return {
         "ok": True,
         "meses_cargados": sorted(meses_ok),
+        "filas_insertadas": len(filas),
+        "por_tipo": por_tipo,
+        "agentes_cruzados": len({f["agente_id"] for f in filas}),
+        "dnis_sin_cruzar": len(dnis_sin_cruzar),
+        "ejemplos_dnis_sin_cruzar": sorted(dnis_sin_cruzar)[:20],
+        "celdas_no_parseables": celdas_skip,
+    }
+
+
+@app.post("/asignaciones/importar")
+async def asignaciones_importar(
+    x_api_key: str = Header(None),
+    archivo: UploadFile = File(...),
+    campana: str = Form(...),
+    meses: str = Form(None),        # opcional "4,5"; por defecto TODAS las fechas del archivo
+    reemplazar: bool = Form(False),
+):
+    """
+    Carga GENÉRICA de parrilla (turnos) -> asignaciones, guiada por la config 'turnos'
+    de la campaña (campana_cargas). Detecta el layout (fila cabecera, columna DNI,
+    columnas de fecha) y mapea cada celda a (tipo, hora_inicio, hora_fin) con:
+      - rangos horarios 'HH:MM-HH:MM' (universal) -> trabajo
+      - el diccionario 'codigos' de la config (CODE -> tipo o {tipo,hora_inicio,hora_fin})
+    Cruza por DNI con la tabla agentes. Sin layout cableado por campaña.
+    """
+    check_key(x_api_key)
+    engine = get_engine()
+    cid = _id_campana(engine, campana)
+    if cid is None:
+        raise HTTPException(400, f"La campaña '{campana}' no existe.")
+    cfg = _leer_config_carga(engine, cid, "turnos")
+    if cfg is None:
+        raise HTTPException(400, f"La campaña '{campana}' no tiene config de carga 'turnos'. Créala en el asistente.")
+    codigos = {str(k).strip().upper(): v for k, v in (cfg.get("codigos") or {}).items()}
+    col_dni_cfg = cfg.get("col_dni")
+    fila_cab_cfg = cfg.get("fila_cabecera")
+    meses_ok = {int(x) for x in str(meses).split(",") if x and x.strip().isdigit()} if meses else None
+
+    ag = pd.read_sql(text("SELECT id, dni FROM agentes"), engine)
+    dni2id = {str(d).strip(): int(i) for i, d in zip(ag["id"], ag["dni"]) if d is not None}
+
+    file_bytes = await archivo.read()
+    from openpyxl import load_workbook
+    wb = load_workbook(io.BytesIO(file_bytes), read_only=True, data_only=True)
+
+    filas = []
+    dnis_sin_cruzar = set()
+    celdas_skip = 0
+    por_tipo = {}
+    for sn in wb.sheetnames:
+        rows = list(wb[sn].iter_rows(values_only=True))
+        if not rows:
+            continue
+        fila_cab, col_dni, cols_fecha = _detecta_layout_parrilla(rows, col_dni_cfg, fila_cab_cfg)
+        if not cols_fecha:
+            continue
+        if meses_ok:
+            cols_fecha = [(ci, f) for ci, f in cols_fecha if f.month in meses_ok]
+        for r in rows[fila_cab + 1:]:
+            if len(r) <= col_dni or r[col_dni] is None:
+                continue
+            dni = str(r[col_dni]).strip()
+            aid = dni2id.get(dni)
+            if aid is None:
+                dnis_sin_cruzar.add(dni)
+                continue
+            for ci, fecha in cols_fecha:
+                if ci >= len(r):
+                    continue
+                res = _par_celda_cfg(r[ci], codigos)
+                if res is None:
+                    continue
+                if res == "SKIP":
+                    celdas_skip += 1
+                    continue
+                tipo, hi, hf = res
+                por_tipo[tipo] = por_tipo.get(tipo, 0) + 1
+                filas.append({
+                    "agente_id": aid, "fecha": fecha, "campana_id": cid,
+                    "turno_id": None, "hora_inicio": hi, "hora_fin": hf,
+                    "tipo": tipo, "creado_por": "import-parrilla", "bloqueado": True,
+                })
+
+    if not filas:
+        raise HTTPException(400, f"No se generaron filas. DNIs sin cruzar: {len(dnis_sin_cruzar)}. "
+                                 f"Revisa que la parrilla tenga cabeceras de fecha y la columna DNI correcta.")
+
+    cols = ["agente_id", "fecha", "campana_id", "turno_id", "hora_inicio", "hora_fin",
+            "tipo", "creado_por", "bloqueado"]
+    actualiza = ", ".join(f"{c}=EXCLUDED.{c}" for c in cols if c not in ("agente_id", "fecha"))
+    conflict = f" ON CONFLICT (agente_id, fecha) DO UPDATE SET {actualiza} "
+    LOTE = 500
+    try:
+        with engine.begin() as conn:
+            for k in range(0, len(filas), LOTE):
+                lote = filas[k:k + LOTE]
+                valores = []
+                params = {}
+                for j, f in enumerate(lote):
+                    valores.append("(" + ", ".join(f":{c}{j}" for c in cols) + ")")
+                    for c in cols:
+                        params[f"{c}{j}"] = f[c]
+                sql = "INSERT INTO asignaciones (" + ", ".join(cols) + ") VALUES " + ", ".join(valores) + conflict
+                conn.execute(text(sql), params)
+    except Exception as e:
+        raise HTTPException(500, f"Error al escribir asignaciones: {type(e).__name__}: {str(e)[:300]}")
+
+    return {
+        "ok": True,
+        "campana": campana,
         "filas_insertadas": len(filas),
         "por_tipo": por_tipo,
         "agentes_cruzados": len({f["agente_id"] for f in filas}),
