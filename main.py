@@ -641,6 +641,102 @@ async def campana_cargas_post(
     return {"ok": True, "campana": campana, "tipo_carga": tipo_carga, "config": cfg}
 
 
+@app.post("/detectar")
+async def detectar(
+    x_api_key: str = Header(None),
+    archivo: UploadFile = File(...),
+    tipo_carga: str = Form("planeacion"),
+    hoja: str = Form(None),   # opcional: forzar una hoja concreta
+):
+    """
+    Inspecciona un archivo (Excel/CSV) SIN escribir nada y devuelve lo que el asistente
+    de configuración necesita para pintar los desplegables: hojas, columnas, una muestra
+    de filas y un mapeo SUGERIDO (fuzzy-match). Pensado para el flujo "cargar y mapear".
+    """
+    check_key(x_api_key)
+    file_bytes = await archivo.read()
+    nombre = (archivo.filename or "").lower()
+    es_csv = nombre.endswith(".csv")
+
+    def _puntua_hoja(cols):
+        cf = _col_por_nombre(cols, "fecha", "dia", "día", "day")
+        cv = _col_por_nombre(cols, "entrantes", "recibidas", "llamadas entrantes",
+                             "ofrecidas", "llamadas", "volumen", "vol")
+        ci = _col_por_nombre(cols, "intervalo", "hora", "franja", "tramo", "interval")
+        cg = _col_por_nombre(cols, "tipo general", "tipo", "cola", "skill", "servicio", "comercializadora")
+        return (1 if cf else 0) + (2 if cv else 0) + (1 if ci else 0) + (1 if cg else 0)
+
+    hojas = []
+    hoja_activa = None
+    if not es_csv:
+        try:
+            from openpyxl import load_workbook
+            wb = load_workbook(io.BytesIO(file_bytes), read_only=True, data_only=True)
+            hojas = list(wb.sheetnames)
+        except Exception as e:
+            raise HTTPException(400, f"No pude abrir el Excel: {type(e).__name__}: {e}")
+        if hoja in hojas:
+            hoja_activa = hoja
+        else:
+            # Elegir la hoja que más "pinta de datos" tiene (la que trae fecha + volumen),
+            # leyendo solo la cabecera de cada hoja (rápido). Evita agarrar hojas de análisis.
+            mejor, mejor_sc = None, -1
+            for h in hojas:
+                try:
+                    cc = [str(c).strip() for c in
+                          pd.read_excel(io.BytesIO(file_bytes), sheet_name=h, nrows=0, engine="openpyxl").columns]
+                except Exception:
+                    cc = []
+                sc = _puntua_hoja(cc)
+                if sc > mejor_sc:
+                    mejor, mejor_sc = h, sc
+            hoja_activa = mejor or (hojas[0] if hojas else None)
+
+    try:
+        if es_csv:
+            df = pd.read_csv(io.BytesIO(file_bytes))
+        else:
+            df = pd.read_excel(io.BytesIO(file_bytes), sheet_name=hoja_activa, engine="openpyxl")
+    except Exception as e:
+        raise HTTPException(400, f"No pude leer los datos: {type(e).__name__}: {e}")
+    df.columns = [str(c).strip() for c in df.columns]
+    columnas = list(df.columns)
+
+    muestra = []
+    for _, r in df.head(3).iterrows():
+        muestra.append({c: (None if pd.isna(r[c]) else str(r[c])) for c in columnas})
+
+    sugerencia = {}
+    if tipo_carga == "planeacion":
+        c_fecha = _col_por_nombre(columnas, "fecha", "dia", "día", "day")
+        c_int = _col_por_nombre(columnas, "intervalo", "hora", "franja", "tramo", "interval")
+        c_vol = _col_por_nombre(columnas, "entrantes", "recibidas", "llamadas entrantes",
+                                "ofrecidas", "llamadas", "volumen", "vol")
+        c_grupo = _col_por_nombre(columnas, "tipo general", "tipo", "cola", "skill",
+                                  "servicio", "comercializadora")
+        sugerencia = {"col_fecha": c_fecha, "col_intervalo": c_int,
+                      "col_volumen": c_vol, "col_grupo": c_grupo}
+        if c_grupo:
+            sugerencia["valores_grupo"] = [str(x) for x in df[c_grupo].dropna().unique().tolist()][:50]
+        hoja_curva = next((h for h in hojas if "curva" in _norm_txt(h)), None)
+        if hoja_curva:
+            sugerencia["hoja_curva"] = hoja_curva
+            sugerencia["formato_sugerido"] = "diario_curva"
+        elif c_int:
+            sugerencia["formato_sugerido"] = "intervalo"
+
+    return {
+        "ok": True,
+        "tipo_carga": tipo_carga,
+        "es_csv": es_csv,
+        "hojas": hojas,
+        "hoja_activa": hoja_activa,
+        "columnas": columnas,
+        "muestra": muestra,
+        "sugerencia": sugerencia,
+    }
+
+
 @app.post("/historico/importar")
 async def historico_importar(
     x_api_key: str = Header(None),
