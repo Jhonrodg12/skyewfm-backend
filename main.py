@@ -674,6 +674,22 @@ async def campana_cargas_post(
     return {"ok": True, "campana": campana, "tipo_carga": tipo_carga, "config": cfg}
 
 
+# Sinónimos de columnas para el mapeo de AGENTES (canónico -> posibles nombres en el archivo)
+AGENTES_CAMPOS = {
+    "dni":                ["dni", "documento", "cedula", "cédula", "nif", "identificacion", "identificación", "id"],
+    "nombre":             ["nombre", "nombre completo", "agente", "empleado", "name"],
+    "centro":             ["centro", "sede", "site", "ciudad", "location"],
+    "pais":               ["pais", "país", "country"],
+    "modo":               ["modo", "modalidad"],
+    "turno":              ["turno", "shift"],
+    "login_acd":          ["login_acd", "login acd", "usuario acd", "login", "usuario", "extension", "extensión", "ext"],
+    "fecha_alta":         ["fecha_alta", "fecha alta", "fecha ingreso", "fecha de alta", "ingreso", "alta", "hire date"],
+    "jornada_horas":      ["jornada_horas", "jornada", "horas", "horas semana", "hours"],
+    "salario_mensual":    ["salario_mensual", "salario", "sueldo", "salary"],
+    "vacaciones_anuales": ["vacaciones_anuales", "vacaciones", "dias vacaciones", "días vacaciones", "vacation"],
+}
+
+
 @app.post("/detectar")
 async def detectar(
     x_api_key: str = Header(None),
@@ -692,6 +708,10 @@ async def detectar(
     es_csv = nombre.endswith(".csv")
 
     def _puntua_hoja(cols):
+        if tipo_carga == "agentes":
+            dni = _col_por_nombre(cols, *AGENTES_CAMPOS["dni"])
+            nom = _col_por_nombre(cols, *AGENTES_CAMPOS["nombre"])
+            return (2 if dni else 0) + (1 if nom else 0)
         cf = _col_por_nombre(cols, "fecha", "dia", "día", "day")
         cv = _col_por_nombre(cols, "entrantes", "recibidas", "llamadas entrantes",
                              "ofrecidas", "llamadas", "volumen", "vol")
@@ -757,6 +777,10 @@ async def detectar(
             sugerencia["formato_sugerido"] = "diario_curva"
         elif c_int:
             sugerencia["formato_sugerido"] = "intervalo"
+
+    elif tipo_carga == "agentes":
+        cols_map = {campo: _col_por_nombre(columnas, *syns) for campo, syns in AGENTES_CAMPOS.items()}
+        sugerencia = {"columnas": cols_map}
 
     return {
         "ok": True,
@@ -2616,13 +2640,29 @@ async def agentes_importar(
 
     raw = await archivo.read()
     nombre_arch = (archivo.filename or "").lower()
+
+    # ¿La campaña tiene config de 'agentes'? -> mapea las columnas del archivo a los nombres canónicos.
+    _cid = pd.read_sql(text("SELECT id FROM campanas WHERE nombre=:n"), engine, params={"n": campana})
+    _cfg_ag = _leer_config_carga(engine, int(_cid["id"][0]), "agentes") if not _cid.empty else None
+    _hoja_ag = (_cfg_ag or {}).get("hoja_datos")
+
     if nombre_arch.endswith(".csv"):
         df = pd.read_csv(io.BytesIO(raw), dtype=str)
     else:
-        df = pd.read_excel(io.BytesIO(raw), dtype=str)
+        df = pd.read_excel(io.BytesIO(raw), sheet_name=(_hoja_ag if _hoja_ag else 0), dtype=str)
     df.columns = [str(c).strip().lower() for c in df.columns]
+
+    # Renombrar según el mapeo de la config (origen -> canónico). Si no hay config, se usan
+    # los nombres tal cual vengan (compatibilidad con el formato clásico de Endesa).
+    if _cfg_ag and isinstance(_cfg_ag.get("columnas"), dict):
+        ren = {}
+        for canon, origen in _cfg_ag["columnas"].items():
+            if origen:
+                ren[str(origen).strip().lower()] = canon
+        df = df.rename(columns=ren)
+
     if "dni" not in df.columns:
-        raise HTTPException(400, "El archivo debe tener una columna 'dni'.")
+        raise HTTPException(400, "El archivo debe tener una columna 'dni' (o mapéala en el asistente).")
 
     def S(v):
         if v is None: return None
