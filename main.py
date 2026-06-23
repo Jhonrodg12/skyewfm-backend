@@ -990,6 +990,7 @@ async def planeacion(
     absentismo: float = Form(0.15),
     campana: str = Form("Endesa"),
     ajuste_pct: float = Form(0.0),   # % de ajuste de volumen (ej. 10 = +10%, -5 = -5%)
+    comparar_skills: bool = Form(False),  # True: añade comparación dedicado vs multiskill por cola
 ):
     """Corre el optimizador y devuelve datos para graficar SIN escribir en la base."""
     check_key(x_api_key)
@@ -1032,6 +1033,40 @@ async def planeacion(
     import math as _m
     presentes = S["te"] + S["tc"]
     en_nomina = _m.ceil(presentes / (1 - absentismo)) if absentismo < 1 else presentes
+
+    # --- Comparación DEDICADO (cola por cola) vs MULTISKILL (pooled) ---
+    # Opt-in: solo si comparar_skills=True. El cálculo principal 'S' es el pooled
+    # (todas las colas sumadas); aquí dimensionamos cada cola por separado y
+    # sumamos, para mostrar el efecto pooling. No rompe el cálculo si falla.
+    comparacion_skills = None
+    if comparar_skills:
+        try:
+            cid_cmp = _id_campana(get_engine(), campana)
+            cfg_cmp = _leer_config_carga(get_engine(), cid_cmp, "planeacion") if cid_cmp else None
+            nombres = [c.get("nombre") for c in ((cfg_cmp or {}).get("colas") or []) if c.get("nombre")]
+            dedicado = []
+            for nom in nombres:
+                ldf = motor.largo_desde_historico(file_bytes, mes, "Nacional España", 4, 6,
+                                                  ajuste, mixto=False, colas_incluidas=[nom])
+                Sd = motor.dimension_roster(ldf, aht, sla, asa, occ, utl, esp_max, largo,
+                                            nda_obj, paciencia, estructura)
+                pres_d = Sd["te"] + Sd["tc"]
+                dedicado.append({
+                    "cola": nom, "volumen": int(Sd["total"]),
+                    "espana_lv": int(Sd["te"]), "colombia_247": int(Sd["tc"]),
+                    "presentes": int(pres_d),
+                    "en_nomina": _m.ceil(pres_d / (1 - absentismo)) if absentismo < 1 else int(pres_d),
+                })
+            tot_ded = sum(d["presentes"] for d in dedicado)
+            comparacion_skills = {
+                "dedicado_por_cola": dedicado,
+                "total_dedicado_presentes": tot_ded,
+                "multiskill_presentes": presentes,
+                "ahorro_pooling": tot_ded - presentes,
+                "ahorro_pct": round(100.0 * (tot_ded - presentes) / tot_ded, 1) if tot_ded else 0,
+            }
+        except Exception as e:
+            comparacion_skills = {"error": f"{type(e).__name__}: {str(e)[:200]}"}
 
     # Guardar los parámetros usados + resumen del resultado para esta campaña+mes
     cid_save = _id_campana(get_engine(), campana)
@@ -1079,6 +1114,7 @@ async def planeacion(
         "por_dia": por_dia,
         "plan_turnos": plan,
         "objetivos": {"occ": round(occ * 100, 1), "nda": round(nda_obj * 100, 1)},
+        "comparacion_skills": comparacion_skills,
     }
 
 

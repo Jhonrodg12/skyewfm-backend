@@ -37,7 +37,7 @@ def nivel_atencion(ag, carga, aht, pac, NMAX=250):
     return 1 - aband / lam
 
 
-def largo_desde_historico(file_bytes, mes, scope, K, semanas, ajuste=0.0, mixto=False):
+def largo_desde_historico(file_bytes, mes, scope, K, semanas, ajuste=0.0, mixto=False, colas_incluidas=None):
     df = pd.read_csv(io.BytesIO(file_bytes))
     df.columns = [c.strip().lower() for c in df.columns]
     df["fecha"] = pd.to_datetime(df["fecha"], errors="coerce")
@@ -46,6 +46,11 @@ def largo_desde_historico(file_bytes, mes, scope, K, semanas, ajuste=0.0, mixto=
     df[volcol] = pd.to_numeric(df[volcol], errors="coerce").fillna(0)
     df = df.dropna(subset=["fecha", "hora"])
     df["hora"] = df["hora"].astype(int)
+    # --- NUEVO: filtrar por cola(s) si se especifica (dimensionado dedicado/multiskill) ---
+    if colas_incluidas and "cola" in df.columns:
+        _wanted = {str(c).strip().lower() for c in colas_incluidas}
+        df = df[df["cola"].astype(str).str.strip().str.lower().isin(_wanted)]
+    # ------------------------------------------------------------------------------------
     hh = df.groupby(["fecha", "hora"])[volcol].sum().reset_index()
     hh.columns = ["fecha", "hora", "vol"]
     dia = hh.groupby("fecha")["vol"].sum()
