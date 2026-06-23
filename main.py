@@ -1609,6 +1609,22 @@ async def conexiones_importar(
         FROM acd_resumen_diario
     """), engine)
     sin = pd.read_sql(text("SELECT DISTINCT login_acd FROM acd_resumen_diario WHERE agente_id IS NULL ORDER BY login_acd LIMIT 30"), engine)
+
+    # --- A) Recalcular adherencia automáticamente para el rango recién cargado ---
+    # El dashboard de adherencia lee de la tabla 'adherencia', que se llena con
+    # /adherencia/calcular. Antes había que dispararlo a mano (o subir un Excel por
+    # el cargador legacy /acd/importar). Aquí lo encadenamos al cargar conexiones,
+    # acotado al rango del archivo. Va en try/except: si el recálculo falla, la
+    # carga de conexiones NO se rompe (el usuario siempre podrá recalcular a mano).
+    adherencia_recalculada = None
+    try:
+        _fechas = [f["fecha"] for f in filas if f.get("fecha")]
+        if _fechas:
+            adherencia_recalculada = adherencia_calcular(
+                x_api_key=x_api_key, desde=str(min(_fechas)), hasta=str(max(_fechas)))
+    except Exception as e:
+        adherencia_recalculada = {"ok": False, "error": f"{type(e).__name__}: {str(e)[:200]}"}
+
     return {
         "ok": True, "campana": campana,
         "filas_validas": len(filas),
@@ -1618,6 +1634,7 @@ async def conexiones_importar(
         "logins_cruzados": int(rep["cruzados"][0]),
         "logins_sin_cruzar": int(rep["sin_cruzar"][0]),
         "ejemplos_sin_cruzar": sin["login_acd"].tolist(),
+        "adherencia_recalculada": adherencia_recalculada,
     }
 
 
