@@ -1176,6 +1176,8 @@ async def generar_roster(
     paciencia: int = Form(90),
     estructura: str = Form("mixto"),
     ajuste_pct: float = Form(0.0),
+    conservar_ids: str = Form(""),   # Pieza E: ids de huérfanos a CONSERVAR (se bloquean)
+    liberar_ids: str = Form(""),     # Pieza E: ids de huérfanos a LIBERAR (se borran)
 ):
     check_key(x_api_key)
     engine = get_engine()
@@ -1255,6 +1257,34 @@ async def generar_roster(
                 filas.append({"agente_id": int(a["id"]), "fecha": d.date(), "campana_id": int(id_campana),
                               "turno_id": int(tid), "hora_inicio": f"{hi:02d}:00", "hora_fin": f"{hora_fin:02d}:00", "tipo": "trabajo", "creado_por": "optimizador-web"})
     n_asig = len(filas)
+
+    # --- Pieza E: gestión de huérfanos (agentes fuera del roster con turnos previos) ---
+    #   conservar_ids -> se BLOQUEAN sus turnos del optimizador (sobreviven al regenerado).
+    #   liberar_ids   -> se BORRAN sus turnos del optimizador (incluso si estaban bloqueados).
+    # Se procesa ANTES del DELETE/insert para que el conservar quede protegido.
+    def _ids_lista(s):
+        out = []
+        for x in str(s or "").split(","):
+            x = x.strip()
+            if x:
+                try: out.append(int(x))
+                except ValueError: pass
+        return out
+    _cons = _ids_lista(conservar_ids); _libr = _ids_lista(liberar_ids)
+    if _cons or _libr:
+        with engine.begin() as conn:
+            if _cons:
+                _in, _p = _in_clause("ag", _cons)
+                _p.update({"c": int(id_campana), "i": dias_mes[0].date(), "f": dias_mes[-1].date()})
+                conn.execute(text(f"UPDATE asignaciones SET bloqueado = true "
+                                  f"WHERE campana_id=:c AND fecha BETWEEN :i AND :f "
+                                  f"AND creado_por='optimizador-web' AND agente_id IN {_in}"), _p)
+            if _libr:
+                _in, _p = _in_clause("ag", _libr)
+                _p.update({"c": int(id_campana), "i": dias_mes[0].date(), "f": dias_mes[-1].date()})
+                conn.execute(text(f"DELETE FROM asignaciones "
+                                  f"WHERE campana_id=:c AND fecha BETWEEN :i AND :f "
+                                  f"AND creado_por='optimizador-web' AND agente_id IN {_in}"), _p)
 
     # 5) Cargar asignaciones (limpiar mes antes, PERO conservando las bloqueadas)
     #    INSERT MULTI-FILA con ON CONFLICT: mete muchas filas por sentencia (rápido),
