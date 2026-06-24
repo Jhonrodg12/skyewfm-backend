@@ -1166,8 +1166,13 @@ async def generar_roster(
     cont_bloq = bloq.groupby("agente_id").size() if not bloq.empty else pd.Series(dtype=int)
     agentes_full_bloq = set(int(a) for a, n in cont_bloq.items() if n >= len(dias_mes))
 
-    # Solo agentes MULTISKILL reciben turno del optimizador (backoffice se asigna aparte)
-    ag = pd.read_sql("SELECT id,nombre,centro,pais,jornada_horas,modo FROM agentes WHERE estado='ACTIVO' AND UPPER(modo)='MULTISKILL' ORDER BY id", engine)
+    # Reciben turno del optimizador los agentes de ESTA campaña marcados como
+    # 'entra_roster' (los que no entran -backoffice, formación- se asignan aparte).
+    # Antes filtraba por modo='MULTISKILL' (overload del campo) y SIN campana_id
+    # (arrastraba agentes de otras campañas). Ahora: por campaña + entra_roster.
+    ag = pd.read_sql(text("SELECT id,nombre,centro,pais,jornada_horas,modo FROM agentes "
+                          "WHERE estado='ACTIVO' AND entra_roster = true AND campana_id = :cid "
+                          "ORDER BY id"), engine, params={"cid": int(id_campana)})
     ag = ag[~ag["id"].isin(agentes_full_bloq)]  # excluir agentes totalmente bloqueados
     esp = ag[ag["pais"] == "España"].to_dict("records")
     col = ag[ag["pais"] == "Colombia"].to_dict("records")
