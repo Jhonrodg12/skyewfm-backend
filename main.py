@@ -690,6 +690,7 @@ AGENTES_CAMPOS = {
     "jornada_horas":      ["jornada_horas", "jornada", "horas", "horas semana", "hours"],
     "salario_mensual":    ["salario_mensual", "salario", "sueldo", "salary"],
     "vacaciones_anuales": ["vacaciones_anuales", "vacaciones", "dias vacaciones", "días vacaciones", "vacation"],
+    "entra_roster":       ["entra_roster", "entra roster", "entra al roster", "roster", "optimiza", "optimizar", "rosterizable"],
 }
 
 
@@ -3126,6 +3127,16 @@ async def agentes_importar(
         if s in ("ES", "ESP", "ESPANA", "ESPAÑA"): return "España"
         return S(p)
 
+    def roster_norm(v):
+        # sí/no/1/0/x/true/false -> bool. Si no viene o no se entiende -> None
+        # (None: en alta usa default true; en update conserva el valor actual).
+        s = S(v)
+        if s is None: return None
+        s = s.strip().lower()
+        if s in ("si", "sí", "true", "1", "x", "yes", "y", "verdadero", "v"): return True
+        if s in ("no", "false", "0", "n", "falso", "f"): return False
+        return None
+
     filas = []
     for _, r in df.iterrows():
         dni = S(r.get("dni"))
@@ -3143,6 +3154,7 @@ async def agentes_importar(
             "jornada_horas": N(r.get("jornada_horas")),
             "salario_mensual": N(r.get("salario_mensual")),
             "vacaciones_anuales": vac,
+            "entra_roster": roster_norm(r.get("entra_roster")),
         })
     if not filas:
         raise HTTPException(400, "No se encontraron filas con dni.")
@@ -3204,7 +3216,8 @@ async def agentes_importar(
         upd    = [f for f in filas if f["dni"] in existentes]
 
         cols = ["dni", "nombre", "centro", "pais", "modo", "turno", "login_acd",
-                "fecha_alta", "jornada_horas", "salario_mensual", "vacaciones_anuales"]
+                "fecha_alta", "jornada_horas", "salario_mensual", "vacaciones_anuales",
+                "entra_roster"]
         LOTE = 500
         for k in range(0, len(nuevos), LOTE):
             lote = nuevos[k:k + LOTE]
@@ -3213,12 +3226,13 @@ async def agentes_importar(
                 vals.append(f"(:dni{j}, :nombre{j}, :centro{j}, :pais{j}, :modo{j}, :turno{j}, "
                             f":login_acd{j}, cast(:fecha_alta{j} as date), cast(:jornada_horas{j} as numeric), "
                             f"cast(:salario_mensual{j} as numeric), cast(:vacaciones_anuales{j} as numeric), "
+                            f"coalesce(cast(:entra_roster{j} as boolean), true), "
                             f":camp{j}, 'ACTIVO')")
                 for c in cols: params[f"{c}{j}"] = f[c]
                 params[f"camp{j}"] = id_camp
             conn.execute(text(
                 "insert into agentes (dni, nombre, centro, pais, modo, turno, login_acd, fecha_alta, "
-                "jornada_horas, salario_mensual, vacaciones_anuales, campana_id, estado) values "
+                "jornada_horas, salario_mensual, vacaciones_anuales, entra_roster, campana_id, estado) values "
                 + ",".join(vals)), params)
 
         for k in range(0, len(upd), LOTE):
@@ -3227,7 +3241,8 @@ async def agentes_importar(
             for j, f in enumerate(lote):
                 vals.append(f"(:dni{j}, :nombre{j}, :centro{j}, :pais{j}, :modo{j}, :turno{j}, "
                             f":login_acd{j}, cast(:fecha_alta{j} as date), cast(:jornada_horas{j} as numeric), "
-                            f"cast(:salario_mensual{j} as numeric), cast(:vacaciones_anuales{j} as numeric), :camp{j})")
+                            f"cast(:salario_mensual{j} as numeric), cast(:vacaciones_anuales{j} as numeric), "
+                            f"cast(:entra_roster{j} as boolean), :camp{j})")
                 for c in cols: params[f"{c}{j}"] = f[c]
                 params[f"camp{j}"] = id_camp
             conn.execute(text(
@@ -3239,10 +3254,11 @@ async def agentes_importar(
                 "jornada_horas = coalesce(v.jornada_horas, a.jornada_horas), "
                 "salario_mensual = coalesce(v.salario_mensual, a.salario_mensual), "
                 "vacaciones_anuales = coalesce(v.vacaciones_anuales, a.vacaciones_anuales), "
+                "entra_roster = coalesce(v.entra_roster, a.entra_roster), "
                 "campana_id = v.camp "
                 "from (values " + ",".join(vals) + ") as "
                 "v(dni, nombre, centro, pais, modo, turno, login_acd, fecha_alta, jornada_horas, "
-                "salario_mensual, vacaciones_anuales, camp) "
+                "salario_mensual, vacaciones_anuales, entra_roster, camp) "
                 "where upper(a.dni) = v.dni"), params)
 
         # usuarios: crear fila de login para agentes nuevos y vincular faltantes
