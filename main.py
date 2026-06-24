@@ -2636,6 +2636,37 @@ async def crm_importar(
 # ============================================================
 #  Agentes · Importar horas/salario por Excel (cruza por dni)
 # ============================================================
+@app.post("/agentes/entra-roster")
+async def agentes_entra_roster(
+    x_api_key: str = Header(None),
+    ids: str = Form(...),            # IDs de agente separados por coma: "10" o "10,20,30"
+    entra_roster: bool = Form(...),  # valor a aplicar (true = entra al roster)
+    campana: str = Form(None),       # opcional: acota a la campaña (seguridad multi-campaña)
+):
+    """Marca/desmarca 'entra_roster' para uno o varios agentes (edición individual o masiva)."""
+    check_key(x_api_key)
+    engine = get_engine()
+    try:
+        id_list = [int(x.strip()) for x in str(ids).split(",") if str(x).strip()]
+    except ValueError:
+        raise HTTPException(400, "ids debe ser una lista de enteros separados por coma.")
+    if not id_list:
+        raise HTTPException(400, "No se recibieron ids de agentes.")
+    in_sql, params = _in_clause("id", id_list)
+    params["val"] = bool(entra_roster)
+    cond = f"id IN {in_sql}"
+    if campana:
+        cid = _id_campana(engine, campana)
+        if cid is None:
+            raise HTTPException(400, f"La campaña '{campana}' no existe.")
+        cond += " AND campana_id = :cid"
+        params["cid"] = int(cid)
+    with engine.begin() as conn:
+        res = conn.execute(text(f"UPDATE agentes SET entra_roster = :val WHERE {cond}"), params)
+        n = res.rowcount
+    return {"ok": True, "actualizados": int(n), "entra_roster": bool(entra_roster)}
+
+
 @app.post("/agentes/importar-horas")
 async def agentes_importar_horas(
     x_api_key: str = Header(None),
