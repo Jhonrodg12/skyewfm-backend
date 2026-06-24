@@ -1119,6 +1119,46 @@ async def planeacion(
     }
 
 
+@app.post("/generar-roster/huerfanos")
+async def roster_huerfanos(
+    x_api_key: str = Header(None),
+    mes: str = Form(...),            # "2026-06"
+    campana: str = Form(...),
+):
+    """Detecta 'huérfanos': agentes que ya NO entran al roster (entra_roster=false)
+    pero tienen turnos del optimizador en el mes. Solo LEE; no modifica nada.
+    Sirve para que el WFM decida conservar/liberar ANTES de regenerar (paso 1 de 2)."""
+    check_key(x_api_key)
+    engine = get_engine()
+    cid = _id_campana(engine, campana)
+    if cid is None:
+        raise HTTPException(400, f"La campaña '{campana}' no existe.")
+    dias = pd.date_range(f"{mes}-01", pd.Timestamp(f"{mes}-01") + pd.offsets.MonthEnd(0))
+    df = pd.read_sql(text("""
+        SELECT a.id AS agente_id, a.nombre, a.centro, a.pais,
+               SUM(CASE WHEN s.tipo='trabajo' THEN 1 ELSE 0 END) AS dias_trabajo,
+               COUNT(*) AS dias_total,
+               MAX(CASE WHEN s.bloqueado IS TRUE THEN 1 ELSE 0 END) AS tiene_bloqueados
+        FROM asignaciones s JOIN agentes a ON a.id = s.agente_id
+        WHERE s.campana_id = :c AND s.fecha BETWEEN :i AND :f
+          AND a.entra_roster = false
+          AND s.creado_por = 'optimizador-web'
+        GROUP BY a.id, a.nombre, a.centro, a.pais
+        ORDER BY a.nombre
+    """), engine, params={"c": int(cid), "i": dias[0].date(), "f": dias[-1].date()})
+    huerfanos = []
+    for _, r in df.iterrows():
+        huerfanos.append({
+            "agente_id": int(r["agente_id"]), "nombre": r["nombre"],
+            "centro": r["centro"], "pais": r["pais"],
+            "dias_trabajo": int(r["dias_trabajo"] or 0),
+            "dias_total": int(r["dias_total"] or 0),
+            "tiene_bloqueados": bool(r["tiene_bloqueados"]),
+        })
+    return {"ok": True, "mes": mes, "campana": campana,
+            "total_huerfanos": len(huerfanos), "huerfanos": huerfanos}
+
+
 @app.post("/generar-roster")
 async def generar_roster(
     x_api_key: str = Header(None),
