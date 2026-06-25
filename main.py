@@ -1032,18 +1032,24 @@ async def planeacion(
                      "libres": f"{NOM[o[0]][:3]}, {NOM[o[1]][:3]}"})
 
     import math as _m
+    # Headline POOLED (multiskill) por defecto = comportamiento actual
     presentes = S["te"] + S["tc"]
     en_nomina = _m.ceil(presentes / (1 - absentismo)) if absentismo < 1 else presentes
+    head_espana = S["te"]; head_colombia = S["tc"]
 
-    # --- Comparación DEDICADO (cola por cola) vs MULTISKILL (pooled) ---
-    # Opt-in: solo si comparar_skills=True. El cálculo principal 'S' es el pooled
-    # (todas las colas sumadas); aquí dimensionamos cada cola por separado y
-    # sumamos, para mostrar el efecto pooling. No rompe el cálculo si falla.
+    # --- Fase 2: modo de dimensionamiento por campaña (dedicado | multiskill) ---
+    # Vive en la config de planeación: {"skills": {"modo": "dedicado"}}. Default multiskill.
+    cid_cmp = _id_campana(get_engine(), campana)
+    cfg_cmp = _leer_config_carga(get_engine(), cid_cmp, "planeacion") if cid_cmp else None
+    modo_dim = (((cfg_cmp or {}).get("skills") or {}).get("modo") or "multiskill")
+
+    # Dimensionado DEDICADO (cola por cola). Se calcula si el usuario pide comparar,
+    # o si la campaña está en modo 'dedicado' (para usarlo como headline). N corridas
+    # del motor (1 por cola); validado en local. No rompe el cálculo si falla.
     comparacion_skills = None
-    if comparar_skills:
+    dedicado_total = None
+    if comparar_skills or modo_dim == "dedicado":
         try:
-            cid_cmp = _id_campana(get_engine(), campana)
-            cfg_cmp = _leer_config_carga(get_engine(), cid_cmp, "planeacion") if cid_cmp else None
             nombres = [c.get("nombre") for c in ((cfg_cmp or {}).get("colas") or []) if c.get("nombre")]
             dedicado = []
             for nom in nombres:
@@ -1059,15 +1065,28 @@ async def planeacion(
                     "en_nomina": _m.ceil(pres_d / (1 - absentismo)) if absentismo < 1 else int(pres_d),
                 })
             tot_ded = sum(d["presentes"] for d in dedicado)
-            comparacion_skills = {
-                "dedicado_por_cola": dedicado,
-                "total_dedicado_presentes": tot_ded,
-                "multiskill_presentes": presentes,
-                "ahorro_pooling": tot_ded - presentes,
-                "ahorro_pct": round(100.0 * (tot_ded - presentes) / tot_ded, 1) if tot_ded else 0,
+            dedicado_total = {
+                "presentes": tot_ded,
+                "espana": sum(d["espana_lv"] for d in dedicado),
+                "colombia": sum(d["colombia_247"] for d in dedicado),
             }
+            if comparar_skills:
+                _pool = S["te"] + S["tc"]
+                comparacion_skills = {
+                    "dedicado_por_cola": dedicado,
+                    "total_dedicado_presentes": tot_ded,
+                    "multiskill_presentes": _pool,
+                    "ahorro_pooling": tot_ded - _pool,
+                    "ahorro_pct": round(100.0 * (tot_ded - _pool) / tot_ded, 1) if tot_ded else 0,
+                }
         except Exception as e:
             comparacion_skills = {"error": f"{type(e).__name__}: {str(e)[:200]}"}
+
+    # Si la campaña es 'dedicado', el headline pasa a ser el total dedicado
+    if modo_dim == "dedicado" and dedicado_total:
+        presentes = dedicado_total["presentes"]
+        en_nomina = _m.ceil(presentes / (1 - absentismo)) if absentismo < 1 else presentes
+        head_espana = dedicado_total["espana"]; head_colombia = dedicado_total["colombia"]
 
     # Guardar los parámetros usados + resumen del resultado para esta campaña+mes
     cid_save = _id_campana(get_engine(), campana)
@@ -1096,8 +1115,8 @@ async def planeacion(
                 """), {"cid": cid_save, "mes": mes, "aht": aht, "sla": sla, "asa": asa,
                        "occ": occ, "utl": utl, "esp_max": esp_max, "largo": largo,
                        "nda_obj": nda_obj, "paciencia": paciencia, "absentismo": absentismo,
-                       "estructura": estructura, "rv": int(S["total"]), "re": int(S["te"]),
-                       "rc": int(S["tc"]), "rp": int(presentes), "rn": int(en_nomina)})
+                       "estructura": estructura, "rv": int(S["total"]), "re": int(head_espana),
+                       "rc": int(head_colombia), "rp": int(presentes), "rn": int(en_nomina)})
         except Exception:
             pass  # si falla el guardado del resumen, no rompemos el cálculo
 
@@ -1107,11 +1126,12 @@ async def planeacion(
         "volumen_total": S["total"],
         "estructura": estructura,
         "plantilla": {
-            "espana_lv": S["te"],
-            "colombia_247": S["tc"],
+            "espana_lv": head_espana,
+            "colombia_247": head_colombia,
             "total_presentes": presentes,
             "en_nomina": en_nomina,
         },
+        "modo_dimensionamiento": modo_dim,
         "por_dia": por_dia,
         "plan_turnos": plan,
         "objetivos": {"occ": round(occ * 100, 1), "nda": round(nda_obj * 100, 1)},
