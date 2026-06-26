@@ -2702,11 +2702,11 @@ def adherencia_export(
         "adh_neta": "ADH Neta %", "utilizacion": "Utilizacion %", "productividad": "Productividad %",
         "infoe": "INFOE %", "llamadas": "Llamadas", "tmo_seg": "TMO (seg)"})
 
-    res_ag = df.groupby(["nombre", "centro", "pais", "modo", "supervisor_nombre"]).apply(kpis, include_groups=False).reset_index()
+    res_ag = df.groupby(["nombre", "centro", "pais", "modo", "supervisor_nombre"], dropna=False).apply(kpis, include_groups=False).reset_index()
     res_ag = res_ag.rename(columns={"nombre": "Agente", "centro": "Centro", "pais": "Pais",
                                     "modo": "Modo", "supervisor_nombre": "Supervisor"})
-    res_pais = df.groupby("pais").apply(kpis, include_groups=False).reset_index().rename(columns={"pais": "Pais"})
-    res_modo = df.groupby("modo").apply(kpis, include_groups=False).reset_index().rename(columns={"modo": "Modo"})
+    res_pais = df.groupby("pais", dropna=False).apply(kpis, include_groups=False).reset_index().rename(columns={"pais": "Pais"})
+    res_modo = df.groupby("modo", dropna=False).apply(kpis, include_groups=False).reset_index().rename(columns={"modo": "Modo"})
     general = kpis(df).to_frame(name=f"{d_ini} a {d_fin}").reset_index().rename(columns={"index": "Indicador"})
 
     import io as _io
