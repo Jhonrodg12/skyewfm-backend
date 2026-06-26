@@ -1733,14 +1733,25 @@ async def conexiones_importar(
     except Exception as e:
         raise HTTPException(500, f"Error al cargar conexiones: {type(e).__name__}: {str(e)[:300]}")
 
-    rep = pd.read_sql(text("""
-        SELECT COUNT(*) AS filas, MIN(fecha) AS desde, MAX(fecha) AS hasta,
-               COUNT(DISTINCT login_acd) AS logins,
-               COUNT(DISTINCT login_acd) FILTER (WHERE agente_id IS NOT NULL) AS cruzados,
-               COUNT(DISTINCT login_acd) FILTER (WHERE agente_id IS NULL) AS sin_cruzar
-        FROM acd_resumen_diario
-    """), engine)
-    sin = pd.read_sql(text("SELECT DISTINCT login_acd FROM acd_resumen_diario WHERE agente_id IS NULL ORDER BY login_acd LIMIT 30"), engine)
+    # --- Resumen de carga SCOPED por campaña y por archivo (Hallazgo #3) ---
+    # Antes este resumen (cruzados / sin cruzar / rango / logins) se calculaba sobre
+    # TODA acd_resumen_diario, mezclando campañas (por eso salía "61" en vez de 56).
+    # Ahora se calcula sobre los logins y fechas de ESTE archivo, cruzados contra los
+    # agentes de ESTA campaña (campana_id=cid). Un login del archivo que solo cuadre
+    # con un agente de OTRA campaña cuenta como "sin cruzar" aquí (lo correcto para
+    # detectar errores de carga). El cruce real de agente_id en la tabla sigue siendo
+    # global; su aislamiento a nivel de tabla queda para una fase posterior (Tier 2).
+    logins_archivo = sorted({str(f["login_acd"]) for f in filas if f.get("login_acd")})
+    fechas_archivo = [f["fecha"] for f in filas if f.get("fecha")]
+    _ag = pd.read_sql(
+        text("SELECT DISTINCT login_acd FROM agentes WHERE campana_id = :cid AND login_acd IS NOT NULL"),
+        engine, params={"cid": cid})
+    logins_campana = {str(x) for x in _ag["login_acd"].tolist()}
+    cruzados = [l for l in logins_archivo if l in logins_campana]
+    sin_cruzar = [l for l in logins_archivo if l not in logins_campana]
+    filas_de_campana = sum(1 for f in filas if str(f.get("login_acd")) in logins_campana)
+    rango_desde = str(min(fechas_archivo)) if fechas_archivo else None
+    rango_hasta = str(max(fechas_archivo)) if fechas_archivo else None
 
     # --- A) Recalcular adherencia automáticamente para el rango recién cargado ---
     # El dashboard de adherencia lee de la tabla 'adherencia', que se llena con
@@ -1760,12 +1771,12 @@ async def conexiones_importar(
     return {
         "ok": True, "campana": campana,
         "filas_validas": len(filas),
-        "total_filas_tabla": int(rep["filas"][0]),
-        "rango": {"desde": str(rep["desde"][0]), "hasta": str(rep["hasta"][0])},
-        "logins_distintos": int(rep["logins"][0]),
-        "logins_cruzados": int(rep["cruzados"][0]),
-        "logins_sin_cruzar": int(rep["sin_cruzar"][0]),
-        "ejemplos_sin_cruzar": sin["login_acd"].tolist(),
+        "total_filas_tabla": filas_de_campana,
+        "rango": {"desde": rango_desde, "hasta": rango_hasta},
+        "logins_distintos": len(logins_archivo),
+        "logins_cruzados": len(cruzados),
+        "logins_sin_cruzar": len(sin_cruzar),
+        "ejemplos_sin_cruzar": sin_cruzar[:30],
         "adherencia_recalculada": adherencia_recalculada,
     }
 
