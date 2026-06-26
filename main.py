@@ -1764,7 +1764,8 @@ async def conexiones_importar(
         _fechas = [f["fecha"] for f in filas if f.get("fecha")]
         if _fechas:
             adherencia_recalculada = adherencia_calcular(
-                x_api_key=x_api_key, desde=str(min(_fechas)), hasta=str(max(_fechas)))
+                x_api_key=x_api_key, desde=str(min(_fechas)), hasta=str(max(_fechas)),
+                campana=campana)
     except Exception as e:
         adherencia_recalculada = {"ok": False, "error": f"{type(e).__name__}: {str(e)[:200]}"}
 
@@ -1789,22 +1790,48 @@ def adherencia_calcular(
     x_api_key: str = Header(None),
     desde: str = None,   # 'YYYY-MM-DD' opcional; si vacio usa el minimo del ACD
     hasta: str = None,   # 'YYYY-MM-DD' opcional; si vacio usa el maximo del ACD
+    campana: str = None, # opcional: si viene, aisla rango/calculo/resumen a esa campaña
 ):
     """
     Cruza el plan (asignaciones, tipo='trabajo') con la realidad (acd_resumen_diario)
     por (agente_id, fecha) y calcula: ADH BRUTA, ADH NETA, UTILIZACION, PRODUCTIVIDAD,
     INFOE, mas TMO y llamadas. HR PRESENCIA sale del turno. Upsert en adherencia.
+
+    Si se pasa 'campana', TODO el cálculo se aísla a esa campaña: el rango por defecto,
+    los días que se calculan/escriben y el resumen devuelto. Sin 'campana' se comporta
+    como antes (global), por compatibilidad con las llamadas existentes.
     """
     check_key(x_api_key)
     engine = get_engine()
 
-    rango = pd.read_sql(text("SELECT MIN(fecha) AS d, MAX(fecha) AS h FROM acd_resumen_diario"), engine)
+    # Resolver campaña (opcional). Con campaña -> aislamiento por campana_id.
+    cid = _id_campana(engine, campana) if campana else None
+    if campana and cid is None:
+        raise HTTPException(400, f"La campaña '{campana}' no existe.")
+
+    # Rango por defecto: global si no hay campaña; acotado a la campaña si la hay
+    # (vía agente_id -> agentes.campana_id, sin tocar el esquema de acd_resumen_diario).
+    if cid is None:
+        rango = pd.read_sql(text("SELECT MIN(fecha) AS d, MAX(fecha) AS h FROM acd_resumen_diario"), engine)
+    else:
+        rango = pd.read_sql(text("""
+            SELECT MIN(d.fecha) AS d, MAX(d.fecha) AS h
+            FROM acd_resumen_diario d
+            JOIN agentes ag ON ag.id = d.agente_id
+            WHERE ag.campana_id = :cid
+        """), engine, params={"cid": cid})
     if rango["d"][0] is None:
-        raise HTTPException(400, "No hay datos en acd_resumen_diario. Importa el Excel primero.")
+        raise HTTPException(400, "No hay datos en acd_resumen_diario para ese ámbito. Importa el Excel primero.")
     d_ini = desde or str(rango["d"][0])
     d_fin = hasta or str(rango["h"][0])
 
-    df = pd.read_sql(text("""
+    # Filtro de campaña reutilizable (asignaciones tiene campana_id).
+    cond_camp = " AND a.campana_id = :cid" if cid is not None else ""
+    params = {"i": d_ini, "f": d_fin}
+    if cid is not None:
+        params["cid"] = cid
+
+    df = pd.read_sql(text(f"""
         SELECT a.agente_id, a.fecha, a.hora_inicio, a.hora_fin,
                d.plataforma, d.seg_login, d.seg_not_ready,
                d.seg_talk_in, d.seg_talk_out, d.seg_hold,
@@ -1814,19 +1841,19 @@ def adherencia_calcular(
           ON d.agente_id = a.agente_id AND d.fecha = a.fecha
         WHERE a.tipo = 'trabajo'
           AND a.hora_inicio IS NOT NULL AND a.hora_fin IS NOT NULL
-          AND a.fecha BETWEEN :i AND :f
-    """), engine, params={"i": d_ini, "f": d_fin})
+          AND a.fecha BETWEEN :i AND :f{cond_camp}
+    """), engine, params=params)
 
-    gap = pd.read_sql(text("""
+    gap = pd.read_sql(text(f"""
         SELECT COUNT(*) AS n, COUNT(DISTINCT a.agente_id) AS agentes
         FROM asignaciones a
         LEFT JOIN acd_resumen_diario d
           ON d.agente_id = a.agente_id AND d.fecha = a.fecha
         WHERE a.tipo = 'trabajo'
           AND a.hora_inicio IS NOT NULL AND a.hora_fin IS NOT NULL
-          AND a.fecha BETWEEN :i AND :f
+          AND a.fecha BETWEEN :i AND :f{cond_camp}
           AND d.id IS NULL
-    """), engine, params={"i": d_ini, "f": d_fin})
+    """), engine, params=params)
 
     if df.empty:
         return {"ok": True, "vacio": True, "rango": {"desde": d_ini, "hasta": d_fin},
@@ -1892,17 +1919,25 @@ def adherencia_calcular(
         ejemplo = filas[0] if filas else {}
         raise HTTPException(500, f"Error al escribir adherencia: {type(e).__name__}: {str(e)[:300]} | ejemplo: {ejemplo}")
 
-    resumen = pd.read_sql(text("""
-        SELECT COUNT(*) AS filas, COUNT(DISTINCT agente_id) AS agentes,
-               ROUND(100.0*SUM(seg_login)   /NULLIF(SUM(seg_presencia),0),1) AS adh_bruta,
-               ROUND(100.0*SUM(seg_efectiva)/NULLIF(SUM(seg_presencia),0),1) AS adh_neta,
-               ROUND(100.0*SUM(seg_efectiva)/NULLIF(SUM(seg_login),0),1)     AS utilizacion,
-               ROUND(100.0*SUM(seg_productiva)/NULLIF(SUM(seg_efectiva),0),1) AS productividad,
-               ROUND(100.0*SUM(seg_productiva)/NULLIF(SUM(seg_login),0),1)   AS infoe,
-               ROUND(SUM(seg_talk+seg_hold)::numeric/NULLIF(SUM(llamadas),0),1) AS tmo,
-               SUM(llamadas) AS llamadas
-        FROM adherencia WHERE fecha BETWEEN :i AND :f
-    """), engine, params={"i": d_ini, "f": d_fin})
+    # Resumen acotado al mismo ámbito: global, o aislado a la campaña vía agentes.
+    join_camp = "JOIN agentes ag ON ag.id = adh.agente_id" if cid is not None else ""
+    cond_camp2 = " AND ag.campana_id = :cid" if cid is not None else ""
+    rparams = {"i": d_ini, "f": d_fin}
+    if cid is not None:
+        rparams["cid"] = cid
+    resumen = pd.read_sql(text(f"""
+        SELECT COUNT(*) AS filas, COUNT(DISTINCT adh.agente_id) AS agentes,
+               ROUND(100.0*SUM(adh.seg_login)   /NULLIF(SUM(adh.seg_presencia),0),1) AS adh_bruta,
+               ROUND(100.0*SUM(adh.seg_efectiva)/NULLIF(SUM(adh.seg_presencia),0),1) AS adh_neta,
+               ROUND(100.0*SUM(adh.seg_efectiva)/NULLIF(SUM(adh.seg_login),0),1)     AS utilizacion,
+               ROUND(100.0*SUM(adh.seg_productiva)/NULLIF(SUM(adh.seg_efectiva),0),1) AS productividad,
+               ROUND(100.0*SUM(adh.seg_productiva)/NULLIF(SUM(adh.seg_login),0),1)   AS infoe,
+               ROUND(SUM(adh.seg_talk+adh.seg_hold)::numeric/NULLIF(SUM(adh.llamadas),0),1) AS tmo,
+               SUM(adh.llamadas) AS llamadas
+        FROM adherencia adh
+        {join_camp}
+        WHERE adh.fecha BETWEEN :i AND :f{cond_camp2}
+    """), engine, params=rparams)
     rr = resumen.iloc[0]
     def fv(x):
         return None if pd.isna(x) else float(x)
