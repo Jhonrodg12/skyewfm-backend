@@ -2353,17 +2353,30 @@ async def asignaciones_importar(
 #  ADHERENCIA · Fase 4 — Datos para el dashboard
 # ============================================================
 @app.get("/adherencia/opciones")
-def adherencia_opciones(x_api_key: str = Header(None)):
-    """Valores para los filtros del dashboard (rango de fechas, paises, centros)."""
+def adherencia_opciones(x_api_key: str = Header(None), campana: str = None):
+    """Valores para los filtros del dashboard (rango de fechas, paises, centros).
+    Con 'campana' se acotan a esa campaña; sin ella, global (como antes)."""
     check_key(x_api_key)
     engine = get_engine()
-    r = pd.read_sql(text("SELECT MIN(fecha) AS d, MAX(fecha) AS h FROM adherencia"), engine)
+    cid = _id_campana(engine, campana) if campana else None
+    if campana and cid is None:
+        raise HTTPException(400, f"La campaña '{campana}' no existe.")
+    if cid is None:
+        r = pd.read_sql(text("SELECT MIN(fecha) AS d, MAX(fecha) AS h FROM adherencia"), engine)
+    else:
+        r = pd.read_sql(text("""
+            SELECT MIN(adh.fecha) AS d, MAX(adh.fecha) AS h
+            FROM adherencia adh JOIN agentes ag ON ag.id = adh.agente_id
+            WHERE ag.campana_id = :cid
+        """), engine, params={"cid": cid})
     if r["d"][0] is None:
         return {"ok": True, "vacio": True}
-    pc = pd.read_sql(text("""
+    cond_camp = " WHERE ag.campana_id = :cid" if cid is not None else ""
+    cparams = {"cid": cid} if cid is not None else {}
+    pc = pd.read_sql(text(f"""
         SELECT DISTINCT ag.pais, ag.centro
-        FROM adherencia adh JOIN agentes ag ON ag.id = adh.agente_id
-    """), engine)
+        FROM adherencia adh JOIN agentes ag ON ag.id = adh.agente_id{cond_camp}
+    """), engine, params=cparams)
     return {
         "ok": True, "vacio": False,
         "desde": str(r["d"][0]), "hasta": str(r["h"][0]),
@@ -2379,15 +2392,28 @@ def adherencia_dashboard(
     hasta: str = None,
     pais: str = None,
     centro: str = None,
+    campana: str = None,
 ):
     """
     Datos agregados de adherencia para el dashboard, segun filtros.
     Adherencia y TMO se calculan ponderados por segundos/llamadas (no promedio simple).
+    Con 'campana' se acota a esa campaña; sin ella, global (como antes).
     """
     check_key(x_api_key)
     engine = get_engine()
 
-    rango = pd.read_sql(text("SELECT MIN(fecha) AS d, MAX(fecha) AS h FROM adherencia"), engine)
+    cid = _id_campana(engine, campana) if campana else None
+    if campana and cid is None:
+        raise HTTPException(400, f"La campaña '{campana}' no existe.")
+
+    if cid is None:
+        rango = pd.read_sql(text("SELECT MIN(fecha) AS d, MAX(fecha) AS h FROM adherencia"), engine)
+    else:
+        rango = pd.read_sql(text("""
+            SELECT MIN(adh.fecha) AS d, MAX(adh.fecha) AS h
+            FROM adherencia adh JOIN agentes ag ON ag.id = adh.agente_id
+            WHERE ag.campana_id = :cid
+        """), engine, params={"cid": cid})
     if rango["d"][0] is None:
         return {"ok": True, "vacio": True}
     d_ini = desde or str(rango["d"][0])
@@ -2395,6 +2421,8 @@ def adherencia_dashboard(
 
     cond = "adh.fecha BETWEEN :i AND :f"
     params = {"i": d_ini, "f": d_fin}
+    if cid is not None:
+        cond += " AND ag.campana_id = :cid"; params["cid"] = cid
     if pais:
         cond += " AND ag.pais = :pais"; params["pais"] = pais
     if centro:
@@ -2600,12 +2628,25 @@ def adherencia_export(
     centro: str = None,
     modo: str = None,
     supervisor: str = None,
+    campana: str = None,
 ):
-    """Descarga un .xlsx con la adherencia (detalle + resumenes) segun filtros."""
+    """Descarga un .xlsx con la adherencia (detalle + resumenes) segun filtros.
+    Con 'campana' se acota a esa campaña; sin ella, global (como antes)."""
     check_key(x_api_key)
     engine = get_engine()
 
-    rango = pd.read_sql(text("SELECT MIN(fecha) AS d, MAX(fecha) AS h FROM adherencia"), engine)
+    cid = _id_campana(engine, campana) if campana else None
+    if campana and cid is None:
+        raise HTTPException(400, f"La campaña '{campana}' no existe.")
+
+    if cid is None:
+        rango = pd.read_sql(text("SELECT MIN(fecha) AS d, MAX(fecha) AS h FROM adherencia"), engine)
+    else:
+        rango = pd.read_sql(text("""
+            SELECT MIN(adh.fecha) AS d, MAX(adh.fecha) AS h
+            FROM adherencia adh JOIN agentes ag ON ag.id = adh.agente_id
+            WHERE ag.campana_id = :cid
+        """), engine, params={"cid": cid})
     if rango["d"][0] is None:
         raise HTTPException(400, "No hay datos de adherencia. Corre /adherencia/calcular primero.")
     d_ini = desde or str(rango["d"][0])
@@ -2613,6 +2654,7 @@ def adherencia_export(
 
     cond = "adh.fecha BETWEEN :i AND :f"
     params = {"i": d_ini, "f": d_fin}
+    if cid is not None: cond += " AND ag.campana_id = :cid";    params["cid"] = cid
     if pais:       cond += " AND ag.pais = :pais";              params["pais"] = pais
     if centro:     cond += " AND ag.centro = :centro";          params["centro"] = centro
     if modo:       cond += " AND ag.modo = :modo";              params["modo"] = modo
