@@ -166,6 +166,116 @@ def dimension_roster(largo, AHT, SLA, ASA, OCC, UTL, ESP_MAX, LARGO, NDA_OBJ, PA
             "total": int(largo["volumen"].sum())}
 
 
+def dimension_roster_fechas(historico, dias_mes, AHT, SLA, ASA, OCC, UTL, ESP_MAX, LARGO,
+                             NDA_OBJ, PACIENCIA, estructura="mixto", necesidad_extra=None,
+                             modo_demanda="trafico"):
+    """
+    Igual que dimension_roster, pero la demanda se calcula por FECHA REAL del mes
+    (dias_mes: lista/DatetimeIndex de fechas) en vez de por día de semana genérico.
+    Necesario para poder combinar el tráfico (Erlang) con necesidad_extra (headcount/
+    FTE cargado manualmente por fecha+hora exacta, módulo Turnos).
+
+    modo_demanda:
+      'trafico'   -> solo Erlang (mismo resultado que dimension_roster, pero evaluado
+                     fecha por fecha en vez de con 7 días genéricos).
+      'headcount' -> IGNORA el tráfico por completo; usa solo necesidad_extra. Pensado
+                     para campañas presenciales sin ACD/llamadas.
+      'combinado' -> Erlang + necesidad_extra sumados hora a hora, por cada fecha.
+
+    necesidad_extra: dict {(fecha_iso 'YYYY-MM-DD', hora 0-23): personas}. None o {} si
+    no hay nada cargado (equivale a 0 en todas las horas).
+
+    NOTA IMPORTANTE (limitación conocida, aceptada por el WFM): el resultado (xe/xc)
+    sigue siendo UN plan mensual único por agente (mismo horario todo el mes, como hoy).
+    Si una fecha puntual pide un refuerzo, el plan se dimensiona para cubrirla, pero el
+    agente que cubre ese refuerzo mantiene su horario el resto del mes — puede quedar
+    de más otros días similares. Cubrir el día puntual SIN sobrante en el resto del mes
+    requeriría mover agentes solo ese día específico (fuera de alcance de este paso).
+    """
+    historico = historico.copy()
+    historico["dow"] = pd.to_datetime(historico["fecha"]).dt.dayofweek
+    volmax = {dw: [0.0] * 24 for dw in range(7)}
+    for (dw, h), g in historico.groupby(["dow", "intervalo"]):
+        volmax[dw][int(h)] = float(g["volumen"].max())
+
+    def _peak_trafico(dw, h):
+        ca = volmax[dw][h] * AHT / 3600
+        if ca <= 0:
+            return 0, 0.0, 1.0
+        a = int(ca) + 1
+        while nivel_servicio(a, ca, AHT, ASA) < SLA:
+            a += 1
+        en = max(a, math.ceil(ca / OCC))
+        while nivel_atencion(en, ca, AHT, PACIENCIA) < NDA_OBJ:
+            en += 1
+        peak_v = math.ceil(en / UTL)
+        return peak_v, ca / en, nivel_atencion(en, ca, AHT, PACIENCIA)
+
+    necesidad_extra = necesidad_extra or {}
+    usa_trafico = modo_demanda != "headcount"
+    usa_extra = modo_demanda != "trafico"
+
+    # Demanda combinada por FECHA REAL + hora (no por día de semana genérico)
+    req_fecha, occ_fecha, nda_fecha = {}, {}, {}
+    for t in dias_mes:
+        f_iso = pd.Timestamp(t).date().isoformat()
+        dw = pd.Timestamp(t).dayofweek
+        reqs, occs, ndas = [0] * 24, [0.0] * 24, [1.0] * 24
+        for h in range(24):
+            peak_v, occ_v, nda_v = _peak_trafico(dw, h) if usa_trafico else (0, 0.0, 1.0)
+            extra = int(necesidad_extra.get((f_iso, h), 0)) if usa_extra else 0
+            reqs[h] = peak_v + extra
+            occs[h] = occ_v
+            ndas[h] = nda_v
+        req_fecha[f_iso] = reqs
+        occ_fecha[f_iso] = occs
+        nda_fecha[f_iso] = ndas
+
+    H = 24
+    turnos = {ini: [(ini + k) % H for k in range(LARGO)] for ini in range(H)}
+    tiene_flex = estructura in ("mixto", "flex")
+    tiene_fijo = estructura in ("mixto", "fijo")
+    m = cp_model.CpModel()
+    xc = {(t, p): m.NewIntVar(0, 300, f"c{t}_{p}") for t in turnos for p in range(7)} if tiene_flex else {}
+    xe = {t: m.NewIntVar(0, 300, f"e{t}") for t in turnos} if tiene_fijo else {}
+    weekend_sin_cubrir = 0
+    for t_date in dias_mes:
+        f_iso = pd.Timestamp(t_date).date().isoformat()
+        dw = pd.Timestamp(t_date).dayofweek
+        for h in range(H):
+            req = req_fecha[f_iso][h]
+            if req <= 0:
+                continue
+            if not tiene_flex and dw in (5, 6):
+                weekend_sin_cubrir += req
+                continue
+            col = sum(xc[(t, p)] for t in turnos for p in range(7) if dw not in LIBRES[p] and h in turnos[t]) if tiene_flex else 0
+            esp = sum(xe[t] for t in turnos if dw not in LIBRES[5] and h in turnos[t]) if tiene_fijo else 0
+            m.Add(col + esp >= req)
+    if estructura == "mixto":
+        m.Add(sum(xe.values()) <= int(ESP_MAX))
+    objetivo = 0
+    if tiene_flex:
+        objetivo = objetivo + sum(xc.values()) * 100
+    if tiene_fijo:
+        objetivo = objetivo + (-sum(xe.values()) if estructura == "mixto" else sum(xe.values()))
+    m.Minimize(objetivo)
+    sv = cp_model.CpSolver()
+    # Límite de tiempo mayor que en dimension_roster (15s): aquí hay hasta ~31 fechas
+    # reales en vez de 7 días genéricos (más restricciones, mismas variables).
+    sv.parameters.max_time_in_seconds = 25.0
+    sv.parameters.num_search_workers = 4
+    sv.Solve(m)
+
+    xe_s = {str(t): sv.Value(xe[t]) for t in xe if sv.Value(xe[t]) > 0}
+    xc_s = {f"{t}_{p}": sv.Value(xc[(t, p)]) for (t, p) in xc if sv.Value(xc[(t, p)]) > 0}
+    te = sum(xe_s.values()); tc = sum(xc_s.values())
+
+    return {"req_fecha": req_fecha, "occ_fecha": occ_fecha, "nda_fecha": nda_fecha,
+            "xe": xe_s, "xc": xc_s, "te": te, "tc": tc, "estructura": estructura,
+            "weekend_sin_cubrir": weekend_sin_cubrir, "modo_demanda": modo_demanda,
+            "total": int(historico["volumen"].sum()) if usa_trafico else 0}
+
 
 # ===== Helpers para visualización de planeación (añadido Bloque 1) =====
 LIBRES_VIZ = {p: {p, (p + 1) % 7} for p in range(7)}

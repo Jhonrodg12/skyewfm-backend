@@ -1155,6 +1155,19 @@ def necesidad_headcount_guardar(
     return {"ok": True, "campana": body.campana, "filas_guardadas": len(procesadas)}
 
 
+def _leer_necesidad_headcount(engine, cid, desde, hasta):
+    """Devuelve la necesidad de headcount cargada para una campaña + rango de fechas,
+    como dict {(fecha_iso, hora): personas} — formato que espera
+    motor.dimension_roster_fechas(necesidad_extra=...)."""
+    if cid is None:
+        return {}
+    df = pd.read_sql(text("""
+        SELECT fecha, hora, personas FROM necesidad_headcount
+        WHERE campana_id = :cid AND fecha BETWEEN :d AND :h
+    """), engine, params={"cid": cid, "d": desde, "h": hasta})
+    return {(r["fecha"].isoformat(), int(r["hora"])): int(r["personas"]) for _, r in df.iterrows()}
+
+
 @app.post("/planeacion")
 async def planeacion(
     x_api_key: str = Header(None),
@@ -1184,20 +1197,57 @@ async def planeacion(
         file_bytes = _historico_a_csv_bytes(eng, _id_campana(eng, campana))
     ajuste = (ajuste_pct or 0.0) / 100.0
     largo_df = motor.largo_desde_historico(file_bytes, mes, "Nacional España", 4, 6, ajuste, mixto=False)
-    S = motor.dimension_roster(largo_df, aht, sla, asa, occ, utl, esp_max, largo,
-                               nda_obj, paciencia, estructura)
-    turnos = motor.turnos_dict(S, largo)
 
-    # Datos por día (0=Lun .. 6=Dom): requerido, programado, ocupación, NDA
+    # --- Config de la campaña (dimensionamiento dedicado/multiskill + módulo Turnos) ---
+    # Vive en la config de planeación: {"skills": {"modo": ...}, "demanda": {"modo": ...}}.
+    cid_cmp = _id_campana(get_engine(), campana)
+    cfg_cmp = _leer_config_carga(get_engine(), cid_cmp, "planeacion") if cid_cmp else None
+    modo_dim = (((cfg_cmp or {}).get("skills") or {}).get("modo") or "multiskill")
+    # Módulo Turnos: 'trafico' (default, sin cambios) | 'headcount' (ignora Erlang) |
+    # 'combinado' (Erlang + necesidad_headcount, por fecha real del mes).
+    modo_demanda = (((cfg_cmp or {}).get("demanda") or {}).get("modo") or "trafico")
+
     NOM = ["Lunes", "Martes", "Miércoles", "Jueves", "Viernes", "Sábado", "Domingo"]
-    por_dia = []
-    for d in range(7):
-        req = [S["peak"][d][h] for h in range(24)]
-        cob = [motor.cubierto(S, turnos, d, h) for h in range(24)]
-        occv = [round(S["occ"][d][h] * 100, 1) for h in range(24)]
-        ndav = [round(S["nda"][d][h] * 100, 1) for h in range(24)]
-        por_dia.append({"dia": d, "nombre": NOM[d], "requerido": req,
-                        "programado": cob, "ocupacion": occv, "nda": ndav})
+    dias_mes = pd.date_range(f"{mes}-01", pd.Timestamp(f"{mes}-01") + pd.offsets.MonthEnd(0))
+
+    if modo_demanda == "trafico":
+        S = motor.dimension_roster(largo_df, aht, sla, asa, occ, utl, esp_max, largo,
+                                   nda_obj, paciencia, estructura)
+        turnos = motor.turnos_dict(S, largo)
+        # Datos por día (0=Lun .. 6=Dom): requerido, programado, ocupación, NDA
+        por_dia = []
+        for d in range(7):
+            req = [S["peak"][d][h] for h in range(24)]
+            cob = [motor.cubierto(S, turnos, d, h) for h in range(24)]
+            occv = [round(S["occ"][d][h] * 100, 1) for h in range(24)]
+            ndav = [round(S["nda"][d][h] * 100, 1) for h in range(24)]
+            por_dia.append({"dia": d, "nombre": NOM[d], "requerido": req,
+                            "programado": cob, "ocupacion": occv, "nda": ndav})
+    else:
+        necesidad_extra = _leer_necesidad_headcount(
+            get_engine(), cid_cmp, dias_mes[0].date(), dias_mes[-1].date())
+        S = motor.dimension_roster_fechas(largo_df, dias_mes, aht, sla, asa, occ, utl, esp_max,
+                                          largo, nda_obj, paciencia, estructura,
+                                          necesidad_extra=necesidad_extra, modo_demanda=modo_demanda)
+        turnos = motor.turnos_dict(S, largo)
+        # Por día de semana: se toma el PEOR caso (máximo) entre todas las fechas del mes
+        # que caen en ese día de semana — así una fecha con refuerzo puntual se refleja
+        # en la gráfica en vez de perderse en un promedio.
+        por_dia = []
+        fechas_por_dow = {d: [] for d in range(7)}
+        for t in dias_mes:
+            fechas_por_dow[pd.Timestamp(t).dayofweek].append(pd.Timestamp(t).date().isoformat())
+        for d in range(7):
+            fechas_d = fechas_por_dow[d]
+            if fechas_d:
+                req = [max(S["req_fecha"][f][h] for f in fechas_d) for h in range(24)]
+                occv = [round(max(S["occ_fecha"][f][h] for f in fechas_d) * 100, 1) for h in range(24)]
+                ndav = [round(min(S["nda_fecha"][f][h] for f in fechas_d) * 100, 1) for h in range(24)]
+            else:
+                req = [0] * 24; occv = [0.0] * 24; ndav = [100.0] * 24
+            cob = [motor.cubierto(S, turnos, d, h) for h in range(24)]
+            por_dia.append({"dia": d, "nombre": NOM[d], "requerido": req,
+                            "programado": cob, "ocupacion": occv, "nda": ndav})
 
     # Plan de turnos (tabla)
     plan = []
@@ -1218,12 +1268,6 @@ async def planeacion(
     presentes = S["te"] + S["tc"]
     en_nomina = _m.ceil(presentes / (1 - absentismo)) if absentismo < 1 else presentes
     head_espana = S["te"]; head_colombia = S["tc"]
-
-    # --- Fase 2: modo de dimensionamiento por campaña (dedicado | multiskill) ---
-    # Vive en la config de planeación: {"skills": {"modo": "dedicado"}}. Default multiskill.
-    cid_cmp = _id_campana(get_engine(), campana)
-    cfg_cmp = _leer_config_carga(get_engine(), cid_cmp, "planeacion") if cid_cmp else None
-    modo_dim = (((cfg_cmp or {}).get("skills") or {}).get("modo") or "multiskill")
 
     # Dimensionado DEDICADO (cola por cola). Se calcula si el usuario pide comparar,
     # o si la campaña está en modo 'dedicado' (para usarlo como headline). N corridas
@@ -1314,6 +1358,7 @@ async def planeacion(
             "en_nomina": en_nomina,
         },
         "modo_dimensionamiento": modo_dim,
+        "modo_demanda": modo_demanda,
         "por_dia": por_dia,
         "plan_turnos": plan,
         "objetivos": {"occ": round(occ * 100, 1), "nda": round(nda_obj * 100, 1)},
