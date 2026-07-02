@@ -2735,12 +2735,17 @@ def adherencia_export(
 async def crm_importar(
     x_api_key: str = Header(None),
     archivo: UploadFile = File(...),
-    campana: str = "Endesa",
+    campana: str = None,
 ):
-    """Sube una base de contactos (xlsx o csv). Columnas conocidas -> campos; el resto -> datos_extra (jsonb)."""
+    """Sube una base de contactos (xlsx o csv). Columnas conocidas -> campos; el resto -> datos_extra (jsonb).
+    'campana' es obligatoria: aisla los contactos importados a esa campaña (antes tenia un default
+    hardcodeado a 'Endesa' que, si no existia, guardaba los contactos con campana_id NULL en silencio)."""
     check_key(x_api_key)
     engine = get_engine()
     import json as _json
+
+    if not campana:
+        raise HTTPException(400, "Falta el parametro 'campana'.")
 
     raw = await archivo.read()
     nombre_arch = (archivo.filename or "").lower()
@@ -2750,8 +2755,9 @@ async def crm_importar(
         df = pd.read_excel(io.BytesIO(raw), dtype=str)
     df.columns = [str(c).strip() for c in df.columns]
 
-    cc = pd.read_sql(text("SELECT id FROM campanas WHERE nombre=:n"), engine, params={"n": campana})
-    id_camp = int(cc["id"][0]) if not cc.empty else None
+    id_camp = _id_campana(engine, campana)
+    if id_camp is None:
+        raise HTTPException(400, f"La campaña '{campana}' no existe.")
 
     conocidas = {"nombre", "documento", "telefono", "telefono2", "email", "direccion", "ciudad"}
     real = {c.lower(): c for c in df.columns}
