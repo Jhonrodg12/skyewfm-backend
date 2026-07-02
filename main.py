@@ -973,6 +973,180 @@ async def historico_importar(
     }
 
 
+# ============================================================
+#  NECESIDAD HEADCOUNT/FTE · Módulo Turnos (independiente del tráfico/Erlang)
+# ============================================================
+# Necesidad de personal por fecha exacta + hora, definida manualmente (grilla o
+# archivo), NO calculada por Erlang. Sirve para dos casos:
+#   1) Campañas de call center: se puede COMBINAR con el tráfico (Paso 4).
+#   2) Campañas presenciales: el cliente define personal por hora directamente,
+#      sin tráfico/ACD de por medio (modo "solo headcount").
+# Tabla: necesidad_headcount (campana_id, fecha, hora, personas), única por
+# (campana_id, fecha, hora) — recargar el mismo día/hora actualiza, no duplica.
+
+NECESIDAD_HC_CAMPOS = {
+    "fecha":    ["fecha", "date", "dia", "día"],
+    "hora":     ["hora", "hour", "franja"],
+    "personas": ["personas", "cantidad", "headcount", "fte", "requerido", "necesidad"],
+}
+
+
+@app.post("/necesidad-headcount/importar")
+async def necesidad_headcount_importar(
+    x_api_key: str = Header(None),
+    archivo: UploadFile = File(...),
+    campana: str = Form(...),
+):
+    """
+    Sube un Excel/CSV con la necesidad de personal por fecha+hora (headcount/FTE).
+    Columnas esperadas: fecha, hora (0-23), personas. Upsert por
+    (campana_id, fecha, hora): recargar el mismo archivo actualiza, no duplica.
+    """
+    check_key(x_api_key)
+    engine = get_engine()
+    cid = _id_campana(engine, campana)
+    if cid is None:
+        raise HTTPException(400, f"La campaña '{campana}' no existe.")
+
+    file_bytes = await archivo.read()
+    df, _fila = _df_con_cabecera_auto(file_bytes, archivo.filename, None, None, clave="fecha")
+
+    mapa = {campo: _buscar_col(df.columns, prefijos) for campo, prefijos in NECESIDAD_HC_CAMPOS.items()}
+    faltan = [k for k in ("fecha", "hora", "personas") if mapa[k] is None]
+    if faltan:
+        raise HTTPException(400, f"Faltan columnas obligatorias {faltan}. Columnas vistas: {list(df.columns)}")
+
+    filas = []
+    filas_hora_invalida = 0
+    for _, r in df.iterrows():
+        fecha_s = _a_txt(r.get(mapa["fecha"]))
+        if not fecha_s:
+            continue
+        try:
+            fecha = pd.to_datetime(fecha_s, dayfirst=True).date()
+        except Exception:
+            continue
+        hora = _a_int(r.get(mapa["hora"]))
+        if hora < 0 or hora > 23:
+            filas_hora_invalida += 1
+            continue
+        personas = _a_int(r.get(mapa["personas"]))
+        filas.append({"campana_id": cid, "fecha": fecha, "hora": hora, "personas": personas,
+                      "creado_por": "import-headcount"})
+
+    if not filas:
+        raise HTTPException(400, "El archivo no tenía filas válidas (revisa columnas fecha/hora/personas).")
+
+    cols = ["campana_id", "fecha", "hora", "personas", "creado_por"]
+    actualiza = ", ".join(f"{c}=EXCLUDED.{c}" for c in cols if c not in ("campana_id", "fecha", "hora"))
+    conflict = f" ON CONFLICT (campana_id, fecha, hora) DO UPDATE SET {actualiza}, actualizado_en = now() "
+
+    LOTE = 500
+    try:
+        with engine.begin() as conn:
+            for k in range(0, len(filas), LOTE):
+                lote = filas[k:k + LOTE]
+                valores = []; params = {}
+                for j, f in enumerate(lote):
+                    valores.append("(" + ", ".join(f":{c}{j}" for c in cols) + ")")
+                    for c in cols:
+                        params[f"{c}{j}"] = f[c]
+                sql = "INSERT INTO necesidad_headcount (" + ", ".join(cols) + ") VALUES " + ", ".join(valores) + conflict
+                conn.execute(text(sql), params)
+    except Exception as e:
+        raise HTTPException(500, f"Error al cargar necesidad de headcount: {type(e).__name__}: {str(e)[:300]}")
+
+    rango_desde = min(f["fecha"] for f in filas)
+    rango_hasta = max(f["fecha"] for f in filas)
+    return {
+        "ok": True, "campana": campana,
+        "filas_cargadas": len(filas),
+        "filas_con_hora_invalida_omitidas": filas_hora_invalida,
+        "rango": {"desde": rango_desde.isoformat(), "hasta": rango_hasta.isoformat()},
+    }
+
+
+@app.get("/necesidad-headcount")
+def necesidad_headcount_get(
+    x_api_key: str = Header(None),
+    campana: str = None,
+    desde: str = None,
+    hasta: str = None,
+):
+    """Devuelve la necesidad de headcount cargada (fecha, hora, personas) de una
+    campaña en un rango de fechas, para pintar la grilla manual en el front."""
+    check_key(x_api_key)
+    engine = get_engine()
+    cid = _id_campana(engine, campana)
+    if cid is None:
+        raise HTTPException(400, f"La campaña '{campana}' no existe.")
+    params = {"cid": cid}
+    cond = ""
+    if desde:
+        cond += " AND fecha >= :d"; params["d"] = desde
+    if hasta:
+        cond += " AND fecha <= :h"; params["h"] = hasta
+    df = pd.read_sql(text(f"""
+        SELECT fecha, hora, personas FROM necesidad_headcount
+        WHERE campana_id = :cid {cond}
+        ORDER BY fecha, hora
+    """), engine, params=params)
+    filas = [{"fecha": r["fecha"].isoformat(), "hora": int(r["hora"]), "personas": int(r["personas"])}
+             for _, r in df.iterrows()]
+    return {"ok": True, "campana": campana, "filas": filas}
+
+
+@app.post("/necesidad-headcount/guardar")
+async def necesidad_headcount_guardar(
+    x_api_key: str = Header(None),
+    campana: str = Form(...),
+    filas: str = Form(...),  # JSON: [{"fecha":"2026-07-15","hora":8,"personas":5}, ...]
+):
+    """Guarda/edita la necesidad de headcount desde la grilla manual del front
+    (upsert fila por fila, misma tabla que la carga de Excel)."""
+    check_key(x_api_key)
+    engine = get_engine()
+    cid = _id_campana(engine, campana)
+    if cid is None:
+        raise HTTPException(400, f"La campaña '{campana}' no existe.")
+    import json as _json
+    try:
+        datos = _json.loads(filas)
+    except Exception as e:
+        raise HTTPException(400, f"'filas' no es JSON válido: {e}")
+    if not isinstance(datos, list) or not datos:
+        raise HTTPException(400, "'filas' debe ser una lista no vacía de {fecha, hora, personas}.")
+
+    procesadas = []
+    for f in datos:
+        try:
+            fecha = pd.to_datetime(f["fecha"]).date()
+            hora = int(f["hora"])
+            personas = int(f["personas"])
+        except Exception:
+            raise HTTPException(400, f"Fila inválida: {f}")
+        if hora < 0 or hora > 23:
+            raise HTTPException(400, f"Hora fuera de rango (0-23): {f}")
+        if personas < 0:
+            raise HTTPException(400, f"'personas' no puede ser negativo: {f}")
+        procesadas.append({"campana_id": cid, "fecha": fecha, "hora": hora, "personas": personas,
+                           "creado_por": "grilla-manual"})
+
+    cols = ["campana_id", "fecha", "hora", "personas", "creado_por"]
+    actualiza = ", ".join(f"{c}=EXCLUDED.{c}" for c in cols if c not in ("campana_id", "fecha", "hora"))
+    conflict = f" ON CONFLICT (campana_id, fecha, hora) DO UPDATE SET {actualiza}, actualizado_en = now() "
+    with engine.begin() as conn:
+        valores = []; params = {}
+        for j, f in enumerate(procesadas):
+            valores.append("(" + ", ".join(f":{c}{j}" for c in cols) + ")")
+            for c in cols:
+                params[f"{c}{j}"] = f[c]
+        sql = "INSERT INTO necesidad_headcount (" + ", ".join(cols) + ") VALUES " + ", ".join(valores) + conflict
+        conn.execute(text(sql), params)
+
+    return {"ok": True, "campana": campana, "filas_guardadas": len(procesadas)}
+
+
 @app.post("/planeacion")
 async def planeacion(
     x_api_key: str = Header(None),
