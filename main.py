@@ -2924,9 +2924,12 @@ async def agentes_importar_horas(
 def nomina_calcular(
     desde: str,
     hasta: str,
+    campana: str,
     x_api_key: str = Header(None),
 ):
-    """Calcula nomina_dia (horas + recargos) para el rango [desde, hasta]. Borra y recalcula ese rango.
+    """Calcula nomina_dia (horas + recargos) para el rango [desde, hasta], AISLADO a 'campana'
+    (obligatoria: nunca se recalcula/borra nómina de todas las campañas de un tirón).
+    Borra y recalcula ese rango, solo para los agentes/asignaciones de esa campaña.
     CO: franja nocturna 19-06 y $ (valor_hora = salario/240, festivo 80/90/100 según fecha).
     ES: franja nocturna 22-06, solo horas (sin $)."""
     check_key(x_api_key)
@@ -2936,6 +2939,10 @@ def nomina_calcular(
     TZ_MAD = ZoneInfo("Europe/Madrid"); TZ_BOG = ZoneInfo("America/Bogota")
 
     datetime.strptime(desde, "%Y-%m-%d"); datetime.strptime(hasta, "%Y-%m-%d")  # valida formato
+
+    cid = _id_campana(engine, campana)
+    if cid is None:
+        raise HTTPException(400, f"La campaña '{campana}' no existe.")
 
     def norm_pais(p):
         u = (p or "").strip().upper()
@@ -2949,7 +2956,8 @@ def nomina_calcular(
         s = str(c).strip().upper()
         return s if s and s != "NAN" else None
 
-    ag = pd.read_sql(text("select id, pais, salario_mensual, centro from agentes"), engine)
+    ag = pd.read_sql(text("select id, pais, salario_mensual, centro from agentes where campana_id = :cid"),
+                      engine, params={"cid": cid})
     info = {int(r.id): (norm_pais(r.pais),
                         (float(r.salario_mensual) if pd.notna(r.salario_mensual) else None),
                         _cu(r.centro))
@@ -2968,8 +2976,8 @@ def nomina_calcular(
 
     asg = pd.read_sql(text("""
         select agente_id, fecha, hora_inicio, hora_fin, tipo, pago
-        from asignaciones where fecha between :d and :h
-    """), engine, params={"d": desde, "h": hasta})
+        from asignaciones where fecha between :d and :h and campana_id = :cid
+    """), engine, params={"d": desde, "h": hasta, "cid": cid})
 
     DIV = 240.0
     def factor_festivo(d):
@@ -2995,7 +3003,7 @@ def nomina_calcular(
         fecha = r.fecha if isinstance(r.fecha, _date) else pd.to_datetime(r.fecha).date()
         tipo = (r.tipo or "").strip()
         pago = bool(r.pago) if r.pago is not None else True
-        base = dict(agente_id=aid, fecha=fecha.isoformat(), tipo=tipo, pago=pago,
+        base = dict(agente_id=aid, campana_id=cid, fecha=fecha.isoformat(), tipo=tipo, pago=pago,
                     horas_prog=0.0, h_diurna_ord=0.0, h_nocturna=0.0,
                     h_festiva_diurna=0.0, h_festiva_nocturna=0.0,
                     val_rec_nocturno=0.0, val_rec_festivo=0.0, val_rec_noct_festivo=0.0)
@@ -3043,10 +3051,11 @@ def nomina_calcular(
             base[k] = round(base[k], 2)
         filas.append(base)
 
-    cols = ["agente_id", "fecha", "tipo", "pago", "horas_prog", "h_diurna_ord", "h_nocturna",
+    cols = ["agente_id", "campana_id", "fecha", "tipo", "pago", "horas_prog", "h_diurna_ord", "h_nocturna",
             "h_festiva_diurna", "h_festiva_nocturna", "val_rec_nocturno", "val_rec_festivo", "val_rec_noct_festivo"]
     with engine.begin() as conn:
-        conn.execute(text("delete from nomina_dia where fecha between :d and :h"), {"d": desde, "h": hasta})
+        conn.execute(text("delete from nomina_dia where fecha between :d and :h and campana_id = :cid"),
+                     {"d": desde, "h": hasta, "cid": cid})
         LOTE = 500
         for k in range(0, len(filas), LOTE):
             lote = filas[k:k + LOTE]
@@ -3057,7 +3066,7 @@ def nomina_calcular(
                     params[f"{c}{j}"] = f[c]
             conn.execute(text("insert into nomina_dia (" + ",".join(cols) + ") values " + ",".join(vals)), params)
 
-    return {"ok": True, "rango": [desde, hasta], "filas_calculadas": len(filas),
+    return {"ok": True, "campana": campana, "rango": [desde, hasta], "filas_calculadas": len(filas),
             "agentes": len(set(f["agente_id"] for f in filas))}
 
 
