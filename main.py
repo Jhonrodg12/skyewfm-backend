@@ -2735,7 +2735,7 @@ def adherencia_export(
 async def crm_importar(
     x_api_key: str = Header(None),
     archivo: UploadFile = File(...),
-    campana: str = None,
+    campana: str = Form(None),
 ):
     """Sube una base de contactos (xlsx o csv). Columnas conocidas -> campos; el resto -> datos_extra (jsonb).
     'campana' es obligatoria: aisla los contactos importados a esa campaña (antes tenia un default
