@@ -15,6 +15,8 @@ from collections import defaultdict
 
 import pandas as pd
 from fastapi import FastAPI, Header, HTTPException, UploadFile, File, Form
+from pydantic import BaseModel
+from typing import List
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import create_engine, text
 
@@ -991,6 +993,17 @@ NECESIDAD_HC_CAMPOS = {
 }
 
 
+class NecesidadHCFila(BaseModel):
+    fecha: str
+    hora: int
+    personas: int
+
+
+class NecesidadHCGuardarBody(BaseModel):
+    campana: str
+    filas: List[NecesidadHCFila]
+
+
 @app.post("/necesidad-headcount/importar")
 async def necesidad_headcount_importar(
     x_api_key: str = Header(None),
@@ -1097,34 +1110,29 @@ def necesidad_headcount_get(
 
 
 @app.post("/necesidad-headcount/guardar")
-async def necesidad_headcount_guardar(
+def necesidad_headcount_guardar(
+    body: NecesidadHCGuardarBody,
     x_api_key: str = Header(None),
-    campana: str = Form(...),
-    filas: str = Form(...),  # JSON: [{"fecha":"2026-07-15","hora":8,"personas":5}, ...]
 ):
     """Guarda/edita la necesidad de headcount desde la grilla manual del front
-    (upsert fila por fila, misma tabla que la carga de Excel)."""
+    (upsert fila por fila, misma tabla que la carga de Excel). Recibe JSON en el
+    cuerpo de la petición (no FormData: aquí no se sube ningún archivo)."""
     check_key(x_api_key)
     engine = get_engine()
-    cid = _id_campana(engine, campana)
+    cid = _id_campana(engine, body.campana)
     if cid is None:
-        raise HTTPException(400, f"La campaña '{campana}' no existe.")
-    import json as _json
-    try:
-        datos = _json.loads(filas)
-    except Exception as e:
-        raise HTTPException(400, f"'filas' no es JSON válido: {e}")
-    if not isinstance(datos, list) or not datos:
+        raise HTTPException(400, f"La campaña '{body.campana}' no existe.")
+    if not body.filas:
         raise HTTPException(400, "'filas' debe ser una lista no vacía de {fecha, hora, personas}.")
 
     procesadas = []
-    for f in datos:
+    for f in body.filas:
         try:
-            fecha = pd.to_datetime(f["fecha"]).date()
-            hora = int(f["hora"])
-            personas = int(f["personas"])
+            fecha = pd.to_datetime(f.fecha).date()
         except Exception:
-            raise HTTPException(400, f"Fila inválida: {f}")
+            raise HTTPException(400, f"Fecha inválida: {f.fecha}")
+        hora = f.hora
+        personas = f.personas
         if hora < 0 or hora > 23:
             raise HTTPException(400, f"Hora fuera de rango (0-23): {f}")
         if personas < 0:
@@ -1144,7 +1152,7 @@ async def necesidad_headcount_guardar(
         sql = "INSERT INTO necesidad_headcount (" + ", ".join(cols) + ") VALUES " + ", ".join(valores) + conflict
         conn.execute(text(sql), params)
 
-    return {"ok": True, "campana": campana, "filas_guardadas": len(procesadas)}
+    return {"ok": True, "campana": body.campana, "filas_guardadas": len(procesadas)}
 
 
 @app.post("/planeacion")
