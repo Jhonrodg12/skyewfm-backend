@@ -3074,14 +3074,20 @@ def nomina_calcular(
 #  Vacaciones · Calcular saldos por año de servicio -> vacaciones_saldo
 # ============================================================
 @app.post("/vacaciones/calcular")
-def vacaciones_calcular(x_api_key: str = Header(None)):
-    """Calcula el saldo de vacaciones por agente según su año de servicio (aniversario de fecha_alta).
+def vacaciones_calcular(campana: str, x_api_key: str = Header(None)):
+    """Calcula el saldo de vacaciones por agente según su año de servicio (aniversario de fecha_alta),
+    AISLADO a 'campana' (obligatoria: antes borraba y recalculaba la tabla COMPLETA sin ningún
+    filtro, ni de campaña ni de fecha, cada vez que se llamaba).
     CO: 15 hábiles (excluye domingos y festivos). ES: 23 laborables (excluye sáb, dom y festivos).
     Días tomados = asignaciones tipo='vacaciones' dentro del periodo (incluye programadas a futuro)."""
     check_key(x_api_key)
     engine = get_engine()
     from datetime import datetime, timedelta, date as _date
     from zoneinfo import ZoneInfo
+
+    cid = _id_campana(engine, campana)
+    if cid is None:
+        raise HTTPException(400, f"La campaña '{campana}' no existe.")
 
     hoy = datetime.now(ZoneInfo("America/Bogota")).date()
 
@@ -3102,7 +3108,8 @@ def vacaciones_calcular(x_api_key: str = Header(None)):
         except ValueError:
             return fa.replace(year=anio, month=2, day=28)  # 29-feb -> 28-feb
 
-    ag = pd.read_sql(text("select id, pais, centro, fecha_alta, vacaciones_anuales from agentes"), engine)
+    ag = pd.read_sql(text("select id, pais, centro, fecha_alta, vacaciones_anuales from agentes where campana_id = :cid"),
+                      engine, params={"cid": cid})
 
     fe = pd.read_sql(text("select fecha, pais, centro from festivos"), engine)
     fest_pais, fest_centro = {}, {}
@@ -3111,7 +3118,8 @@ def vacaciones_calcular(x_api_key: str = Header(None)):
         p = norm_pais(r.pais); c = _cu(r.centro)
         (fest_pais.setdefault(p, set()) if c is None else fest_centro.setdefault((p, c), set())).add(d)
 
-    av = pd.read_sql(text("select agente_id, fecha from asignaciones where tipo = 'vacaciones'"), engine)
+    av = pd.read_sql(text("select agente_id, fecha from asignaciones where tipo = 'vacaciones' and campana_id = :cid"),
+                      engine, params={"cid": cid})
     vac_por_agente = {}
     for r in av.itertuples():
         d = r.fecha if isinstance(r.fecha, _date) else pd.to_datetime(r.fecha).date()
@@ -3156,16 +3164,16 @@ def vacaciones_calcular(x_api_key: str = Header(None)):
             tomados += 1
 
         filas.append(dict(
-            agente_id=aid, periodo_inicio=periodo_inicio.isoformat(), periodo_fin=periodo_fin.isoformat(),
+            agente_id=aid, campana_id=cid, periodo_inicio=periodo_inicio.isoformat(), periodo_fin=periodo_fin.isoformat(),
             unidad=("hábiles" if pais == "CO" else "laborables"),
             cupo_anual=anuales, causado=causado, tomados=tomados,
             saldo_disponible=round(causado - tomados, 1), pendiente_cupo=round(anuales - tomados, 1),
         ))
 
-    cols = ["agente_id", "periodo_inicio", "periodo_fin", "unidad", "cupo_anual",
+    cols = ["agente_id", "campana_id", "periodo_inicio", "periodo_fin", "unidad", "cupo_anual",
             "causado", "tomados", "saldo_disponible", "pendiente_cupo"]
     with engine.begin() as conn:
-        conn.execute(text("delete from vacaciones_saldo"))
+        conn.execute(text("delete from vacaciones_saldo where campana_id = :cid"), {"cid": cid})
         LOTE = 500
         for k in range(0, len(filas), LOTE):
             lote = filas[k:k + LOTE]
@@ -3176,7 +3184,7 @@ def vacaciones_calcular(x_api_key: str = Header(None)):
                     params[f"{c}{j}"] = f[c]
             conn.execute(text("insert into vacaciones_saldo (" + ",".join(cols) + ") values " + ",".join(vals)), params)
 
-    return {"ok": True, "agentes": len(filas), "fecha_referencia": hoy.isoformat()}
+    return {"ok": True, "campana": campana, "agentes": len(filas), "fecha_referencia": hoy.isoformat()}
 
 
 # ============================================================
