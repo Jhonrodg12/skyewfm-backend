@@ -3763,7 +3763,16 @@ def campana_parametros_get(
         return {"ok": True, "existe": False}
     r = row.iloc[0]
     def _n(v):
-        return None if pd.isna(v) else (float(v) if isinstance(v, float) else v)
+        # pd.read_sql devuelve enteros/floats de una columna numérica como tipos de
+        # numpy (numpy.int64, numpy.float64), que FastAPI/jsonable_encoder NO puede
+        # serializar a JSON directamente (bug latente: nunca mordía porque hasta
+        # ahora nunca había filas guardadas para leer de vuelta). .item() los
+        # convierte al tipo nativo de Python (int/float) antes de devolverlos.
+        if v is None or (isinstance(v, float) and pd.isna(v)):
+            return None
+        if hasattr(v, "item"):
+            return v.item()
+        return v
     return {
         "ok": True, "existe": True,
         "parametros": {
