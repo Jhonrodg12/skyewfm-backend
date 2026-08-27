@@ -72,6 +72,37 @@ def _agrupar_por_semana(fechas):
 
 
 # ---------------------------------------------------------------------------
+# 2.5) Puente con motor.dimension_roster_fechas(): convierte su salida
+#      ('req_fecha': {fecha_iso: [24 valores por hora]}) en lo que necesita
+#      este repartidor: cuántos agentes deben trabajar cada día (el pico de la
+#      curva, ya que las horas de inicio se reparten después según esa misma
+#      curva) y el perfil horario de cada día (para repartir horas de inicio).
+# ---------------------------------------------------------------------------
+def necesidad_desde_dimension_fechas(S):
+    """
+    S: el dict devuelto por motor.dimension_roster_fechas() (o compatible: debe
+       tener la clave 'req_fecha' -> {fecha_iso 'YYYY-MM-DD': [24 floats/ints]}).
+
+    Devuelve:
+      necesidad_diaria: {date: int}  — nº de agentes que deben trabajar ese día
+                        (pico horario: agentes suficientes para cubrir la hora
+                        de mayor demanda, ya que el resto de horas se cubren
+                        con un subconjunto de los mismos agentes trabajando).
+      perfil_horas_por_dia: {date: {hora: peso}} — para repartir hora de inicio
+                        proporcional a la curva real de ese día.
+    """
+    from datetime import datetime as _dt
+
+    necesidad_diaria = {}
+    perfil_horas_por_dia = {}
+    for f_iso, horas in S["req_fecha"].items():
+        f = _dt.strptime(f_iso, "%Y-%m-%d").date()
+        necesidad_diaria[f] = int(math.ceil(max(horas))) if horas else 0
+        perfil_horas_por_dia[f] = {h: v for h, v in enumerate(horas) if v > 0}
+    return necesidad_diaria, perfil_horas_por_dia
+
+
+# ---------------------------------------------------------------------------
 # 3) Núcleo: asignación de calendario trabajo/descanso vía CP-SAT
 # ---------------------------------------------------------------------------
 def asignar_calendario(fechas, necesidad_diaria, agentes, max_time_seconds=20.0):

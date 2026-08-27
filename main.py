@@ -22,6 +22,7 @@ from sqlalchemy import create_engine, text
 
 import motor
 import repartidor
+import repartidor_v2
 
 app = FastAPI(title="WFM Optimizer API")
 
@@ -1582,6 +1583,201 @@ async def generar_roster(
         "nota": "Asignaciones generadas. Los breaks se generan en el paso siguiente.",
         "colombia": res_col,
         "espana": res_esp,
+    }
+
+
+# ============================================================
+# Pegar este bloque en main.py, junto a los demás @app.post(...).
+# Requiere: "import repartidor_v2" al inicio del archivo (junto a
+# "import motor" y "import repartidor" ya existentes).
+#
+# Diferencias clave frente a /generar-roster (v1):
+#   - Usa dimension_roster_fechas() (fecha real) en vez de dimension_roster()
+#     (día de semana genérico) — ya usado internamente por el v1 en otros
+#     flujos, así que motor.py no necesita cambios.
+#   - Lee reglas por agente desde la vista agentes_reglas (país + overrides)
+#     en vez de partir el reparto en dos grupos fijos (España/Colombia).
+#   - creado_por = "optimizador-v2", para poder distinguir en 'asignaciones'
+#     qué filas vinieron del motor nuevo vs el viejo mientras se valida.
+#   - Respeta 'bloqueado' exactamente igual que el v1: no toca esos días.
+# ============================================================
+
+@app.post("/generar-roster-v2")
+async def generar_roster_v2(
+    x_api_key: str = Header(None),
+    mes: str = Form(...),                 # "2026-08"
+    campana: str = Form("Endesa"),
+    archivo: UploadFile = File(None),
+    aht: int = Form(420),
+    sla: float = Form(0.80),
+    asa: int = Form(20),
+    occ: float = Form(0.65),
+    utl: float = Form(0.88),
+    esp_max: int = Form(12),              # se mantiene por compatibilidad de firma; ya no limita "España" a mano
+    largo: int = Form(9),
+    nda_obj: float = Form(0.96),
+    paciencia: int = Form(90),
+    estructura: str = Form("mixto"),      # se mantiene por compatibilidad; el mix real ahora sale de agentes_reglas
+    ajuste_pct: float = Form(0.0),
+    conservar_ids: str = Form(""),
+    liberar_ids: str = Form(""),
+):
+    check_key(x_api_key)
+    engine = get_engine()
+    import repartidor_v2
+
+    id_campana = pd.read_sql(text("SELECT id FROM campanas WHERE nombre=:n"),
+                              engine, params={"n": campana})["id"][0]
+
+    # 1) Histórico -> forecast -> requerido por franja (fecha real, no día genérico)
+    if archivo is not None:
+        file_bytes = await archivo.read()
+    else:
+        file_bytes = _historico_a_csv_bytes(engine, int(id_campana))
+    ajuste = (ajuste_pct or 0.0) / 100.0
+    largo_df = motor.largo_desde_historico(file_bytes, mes, "Nacional España", 4, 6, ajuste, mixto=False)
+
+    dias_mes = pd.date_range(f"{mes}-01", pd.Timestamp(f"{mes}-01") + pd.offsets.MonthEnd(0))
+
+    S = motor.dimension_roster_fechas(
+        largo_df, dias_mes, aht, sla, asa, occ, utl, esp_max, largo,
+        nda_obj, paciencia, estructura=estructura, modo_demanda="trafico",
+    )
+    necesidad_diaria, perfil_horas_por_dia = repartidor_v2.necesidad_desde_dimension_fechas(S)
+
+    # --- BLOQUEOS: igual que el v1, no se regeneran los días fijados por el WFM ---
+    bloq = pd.read_sql(text("""
+        SELECT agente_id, fecha FROM asignaciones
+        WHERE campana_id=:c AND fecha BETWEEN :i AND :f AND bloqueado = true
+    """), engine, params={"c": int(id_campana), "i": dias_mes[0].date(), "f": dias_mes[-1].date()})
+    dias_bloqueados = set((int(r["agente_id"]), pd.Timestamp(r["fecha"]).date()) for _, r in bloq.iterrows())
+    cont_bloq = bloq.groupby("agente_id").size() if not bloq.empty else pd.Series(dtype=int)
+    agentes_full_bloq = set(int(a) for a, n in cont_bloq.items() if n >= len(dias_mes))
+
+    # 2) Reglas por agente desde agentes_reglas (país + overrides), en vez del split fijo España/Colombia
+    ag = pd.read_sql(text("""
+        SELECT id, dias_descanso_semana, patron_descanso, max_dias_consecutivos,
+               horas_semana, largo_turno_horas
+        FROM agentes_reglas ar
+        JOIN agentes a ON a.id = ar.id
+        WHERE a.estado='ACTIVO' AND a.entra_roster = true AND a.campana_id = :cid
+        ORDER BY a.id
+    """), engine, params={"cid": int(id_campana)})
+    ag = ag[~ag["id"].isin(agentes_full_bloq)]
+    agentes = ag.to_dict("records")
+
+    if not agentes:
+        raise HTTPException(400, "No hay agentes activos con reglas resueltas (revisa agentes_reglas / entra_roster).")
+
+    # 3) Asignación de calendario (CP-SAT) + hora de inicio
+    fechas = list(necesidad_diaria.keys())
+    asignaciones_cal, resumen_cal = repartidor_v2.asignar_calendario(
+        fechas, necesidad_diaria, agentes, max_time_seconds=25.0
+    )
+    asignaciones_cal = repartidor_v2.asignar_horas_inicio(asignaciones_cal, perfil_horas_por_dia)
+
+    # 4) Registrar turnos usados (misma tabla 'turnos' que el v1)
+    horas_usadas = sorted({a["hora_inicio"] for a in asignaciones_cal if a["trabaja"]})
+    turno_id_por_hora = {}
+    with engine.begin() as conn:
+        for h in horas_usadas:
+            hora_str = f"{h:02d}:00"
+            row = conn.execute(text("SELECT id FROM turnos WHERE hora_inicio=:hi AND duracion_horas=:du LIMIT 1"),
+                                {"hi": hora_str, "du": largo}).fetchone()
+            if row:
+                turno_id_por_hora[h] = row[0]
+            else:
+                r = conn.execute(text("INSERT INTO turnos (nombre,hora_inicio,duracion_horas,descripcion) "
+                                       "VALUES (:n,:hi,:du,:de) RETURNING id"),
+                                  {"n": f"Turno {hora_str} ({largo}h)", "hi": hora_str, "du": largo,
+                                   "de": f"Optimizador v2 {mes}"}).fetchone()
+                turno_id_por_hora[h] = r[0]
+
+    # 5) Filas de asignaciones (saltando días bloqueados)
+    filas = []
+    for a in asignaciones_cal:
+        aid = a["agente_id"]; f = a["fecha"]
+        if (aid, f) in dias_bloqueados:
+            continue
+        if not a["trabaja"]:
+            filas.append({"agente_id": aid, "fecha": f, "campana_id": int(id_campana),
+                          "turno_id": None, "hora_inicio": None, "hora_fin": None,
+                          "tipo": "libre", "creado_por": "optimizador-v2"})
+        else:
+            hi = a["hora_inicio"]; hora_fin = (hi + largo) % 24
+            filas.append({"agente_id": aid, "fecha": f, "campana_id": int(id_campana),
+                          "turno_id": int(turno_id_por_hora[hi]), "hora_inicio": f"{hi:02d}:00",
+                          "hora_fin": f"{hora_fin:02d}:00", "tipo": "trabajo", "creado_por": "optimizador-v2"})
+    n_asig = len(filas)
+
+    # 6) Huérfanos (idéntico al v1)
+    def _ids_lista(s):
+        out = []
+        for x in str(s or "").split(","):
+            x = x.strip()
+            if x:
+                try: out.append(int(x))
+                except ValueError: pass
+        return out
+    _cons = _ids_lista(conservar_ids); _libr = _ids_lista(liberar_ids)
+    if _cons or _libr:
+        with engine.begin() as conn:
+            if _cons:
+                _in, _p = _in_clause("ag", _cons)
+                _p.update({"c": int(id_campana), "i": dias_mes[0].date(), "f": dias_mes[-1].date()})
+                conn.execute(text(f"UPDATE asignaciones SET bloqueado = true "
+                                  f"WHERE campana_id=:c AND fecha BETWEEN :i AND :f "
+                                  f"AND creado_por IN ('optimizador-web','optimizador-v2') AND agente_id IN {_in}"), _p)
+            if _libr:
+                _in, _p = _in_clause("ag", _libr)
+                _p.update({"c": int(id_campana), "i": dias_mes[0].date(), "f": dias_mes[-1].date()})
+                conn.execute(text(f"DELETE FROM asignaciones "
+                                  f"WHERE campana_id=:c AND fecha BETWEEN :i AND :f "
+                                  f"AND creado_por IN ('optimizador-web','optimizador-v2') AND agente_id IN {_in}"), _p)
+
+    # 7) Escribir asignaciones (mismo patrón multi-fila + ON CONFLICT que el v1)
+    try:
+        with engine.begin() as conn:
+            conn.execute(text("DELETE FROM asignaciones WHERE campana_id=:c AND fecha>=:i AND fecha<=:f "
+                              "AND (bloqueado IS NULL OR bloqueado = false)"),
+                        {"c": int(id_campana), "i": dias_mes[0].date(), "f": dias_mes[-1].date()})
+
+        cols = ["agente_id", "fecha", "campana_id", "turno_id", "hora_inicio", "hora_fin", "tipo", "creado_por"]
+        conflict = """
+            ON CONFLICT (agente_id, fecha) DO UPDATE SET
+                campana_id = EXCLUDED.campana_id,
+                turno_id = EXCLUDED.turno_id,
+                hora_inicio = EXCLUDED.hora_inicio,
+                hora_fin = EXCLUDED.hora_fin,
+                tipo = EXCLUDED.tipo,
+                creado_por = EXCLUDED.creado_por
+            WHERE asignaciones.bloqueado IS NOT TRUE
+        """
+        LOTE = 500
+        with engine.begin() as conn:
+            for k in range(0, len(filas), LOTE):
+                lote = filas[k:k+LOTE]
+                valores, params = [], {}
+                for j, f in enumerate(lote):
+                    valores.append(f"(:agente_id{j}, :fecha{j}, :campana_id{j}, :turno_id{j}, "
+                                    f":hora_inicio{j}, :hora_fin{j}, :tipo{j}, :creado_por{j})")
+                    for col in cols:
+                        params[f"{col}{j}"] = f[col]
+                sql = "INSERT INTO asignaciones (" + ", ".join(cols) + ") VALUES " + ", ".join(valores) + conflict
+                conn.execute(text(sql), params)
+    except Exception as e:
+        ejemplo = filas[0] if filas else {}
+        raise HTTPException(500, f"Error al escribir asignaciones (v2): {type(e).__name__}: {str(e)[:300]} | ejemplo fila: {ejemplo}")
+
+    return {
+        "ok": True,
+        "mes": mes,
+        "volumen_total": S.get("total"),
+        "asignaciones": n_asig,
+        "cobertura_status": resumen_cal["status"],
+        "deficit_total": resumen_cal["deficit_total"],
+        "agentes_considerados": len(agentes),
+        "nota": "Generado con optimizador-v2 (reglas por agentes_reglas). Breaks: usar /generar-breaks igual que hoy.",
     }
 
 
